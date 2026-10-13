@@ -37,7 +37,6 @@ COPY --from=builder /install /usr/local
 
 # Copy application source (CSV stays on host — not baked into image)
 COPY src/                    ./src/
-COPY ed_triage_eda_pipeline.py ./
 
 # Create runtime directories; set ownership
 RUN mkdir -p ml_runs outputs/audit logs && \

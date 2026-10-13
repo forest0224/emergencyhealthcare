@@ -35,12 +35,19 @@ WORKDIR /app
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source (CSV stays on host — not baked into image)
-COPY src/                    ./src/
+# Copy application source + training data
+COPY src/                              ./src/
+COPY run_full_pipeline.py              ./
+COPY master_emergency_triage_dataset.csv ./
 
-# Create runtime directories; set ownership
-RUN mkdir -p ml_runs outputs/audit logs && \
-    chown -R app:app /app
+# Create runtime directories
+RUN mkdir -p ml_runs outputs/audit logs
+
+# Train model at build time so best_model.pkl is baked into the image
+RUN python run_full_pipeline.py --mode train
+
+# Set ownership after training produces ml_runs/ files
+RUN chown -R app:app /app
 
 # Switch to non-root user
 USER app

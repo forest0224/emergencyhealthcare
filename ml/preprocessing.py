@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
 
 # ---------------------------------------------------------------------------
 # Optional: MICE imputer
@@ -208,29 +207,6 @@ def one_hot_age_bucket(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def cross_fit_target_encode(
-    df: pd.DataFrame,
-    col: str,
-    target: pd.Series,
-    n_splits: int = 5,
-) -> tuple[pd.Series, dict[str, float]]:
-    """Cross-fitted target encoding for a categorical column — prevents leakage."""
-    encoded = pd.Series(np.nan, index=df.index, name=col + "_enc")
-    global_mean = float(target.mean())
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
-
-    for tr_idx, val_idx in kf.split(df):
-        fold_map = (
-            target.iloc[tr_idx]
-            .groupby(df[col].iloc[tr_idx].values)
-            .mean()
-        )
-        encoded.iloc[val_idx] = df[col].iloc[val_idx].map(fold_map).fillna(global_mean).values
-
-    full_map = {str(k): float(v) for k, v in target.groupby(df[col].values).mean().to_dict().items()}
-    return encoded.fillna(global_mean), full_map
-
-
 def encode_gender(series: pd.Series) -> pd.Series:
     """Encode gender to F=0, M=1, unknown=-1."""
     return series.map(GENDER_MAP).fillna(-1).astype(int)
@@ -272,12 +248,21 @@ def training_data(csv_path: str) -> pd.DataFrame:
     return df
 
 
+TRIAGE_COLUMNS = [*MICE_COLS, "arrival_hour", "gender"]
+
+
+def clean_triage_inputs(df: pd.DataFrame, bounds: pd.DataFrame) -> pd.DataFrame:
+    frame = df.reindex(columns=TRIAGE_COLUMNS).copy()
+    frame[MICE_COLS] = frame[MICE_COLS].apply(pd.to_numeric)
+    frame = handle_outliers(frame, bounds)
+    inverted = frame["systolic_bp"] <= frame["diastolic_bp"]
+    frame.loc[inverted, ["systolic_bp", "diastolic_bp"]] = np.nan
+    return frame
+
+
 def transform_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
     """Apply fitted transformations to validation or inference records."""
-    frame = df.reindex(columns=[*MICE_COLS, "arrival_hour", "gender", "chief_complaint"]).copy()
-    frame[MICE_COLS] = frame[MICE_COLS].apply(pd.to_numeric)
-    bounds = meta["outlier_bounds"]
-    frame = handle_outliers(frame, bounds)
+    frame = clean_triage_inputs(df, meta["outlier_bounds"])
     if meta["mice_imputer"] is not None:
         frame[MICE_COLS] = meta["mice_imputer"].transform(frame[MICE_COLS])
     frame[MICE_COLS] = frame[MICE_COLS].fillna(meta["medians"])
@@ -286,39 +271,36 @@ def transform_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
         pd.to_numeric(frame["arrival_hour"]), 24
     )
     frame["gender_enc"] = encode_gender(frame["gender"])
-    frame["chief_complaint_enc"] = (
-        frame["chief_complaint"].fillna("").str.strip().str.lower()
-        .map(meta["cat_maps"]["chief_complaint"]).fillna(meta["target_mean"])
-    )
+    # Support already-deployed legacy artifact formats.
+    if "chief_complaint_enc" in meta["feature_names"]:
+        complaint = df["chief_complaint"].fillna("").str.strip().str.lower()
+        frame["chief_complaint_enc"] = complaint.map(
+            meta["cat_maps"]["chief_complaint"]
+        ).fillna(meta["target_mean"])
     return one_hot_age_bucket(frame).reindex(columns=meta["feature_names"]).fillna(0)
 
 
 def fit_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, dict]:
-    """Fit preprocessing on a training partition and cross-fit complaint encoding."""
+    """Fit all learned preprocessing on the supplied training partition."""
     df = df.copy().reset_index(drop=True)
-    dm = df["chief_complaint"].fillna("").str.strip().str.lower()
-    df["chief_complaint"] = dm
     y = df[TARGET_COL].astype(int)
-    # Keep extreme readings inside the API validation ranges.
     bounds = pd.DataFrame(
         [(name, low, high) for name, (low, high) in INPUT_BOUNDS.items()],
         columns=["col", "lower", "upper"],
     )
-    cleaned = handle_outliers(df, bounds)
-    medians = cleaned[MICE_COLS].median().fillna(0)
+    cleaned = clean_triage_inputs(df, bounds)
+    medians = cleaned[MICE_COLS].median().fillna(
+        {name: sum(INPUT_BOUNDS[name]) / 2 for name in MICE_COLS}
+    )
     imputed, imputer = apply_mice(cleaned, MICE_COLS)
     derived = add_derived_features(imputed)
-    features = [*MICE_COLS, *derived.columns.difference(df.columns),
-                "arrival_sin", "arrival_cos", "chief_complaint_enc", "gender_enc",
-                *AGE_LABELS]
+    features = [*MICE_COLS, *derived.columns.difference(cleaned.columns),
+                "arrival_sin", "arrival_cos", "gender_enc", *AGE_LABELS]
     meta = {
         "feature_names": features, "outlier_bounds": bounds, "medians": medians,
-        "mice_imputer": imputer, "target_mean": float(y.mean()),
-        "cat_maps": {"chief_complaint": df.groupby("chief_complaint")[TARGET_COL].mean().to_dict()},
+        "mice_imputer": imputer,
     }
-    X = transform_features(df, meta)
-    X["chief_complaint_enc"], _ = cross_fit_target_encode(df, "chief_complaint", y)
-    return X, y, meta
+    return transform_features(df, meta), y, meta
 
 
 def build_features(csv_path: str) -> tuple[pd.DataFrame, pd.Series, dict]:

@@ -154,6 +154,8 @@ class PredictionOut(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     latency_ms: int | None = None
     model_version: str = Field(description="Active model version ID.")
+    assessment_id: str | None = None
+    assessment_replayed: bool = False
     disclaimer: str = Field(
         default=(
             "Decision-support only. Not a diagnosis. "
@@ -176,6 +178,8 @@ class RationaleOut(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     latency_ms: int | None = None
     model_version: str = Field(description="Active model version ID.")
+    assessment_id: str | None = None
+    assessment_replayed: bool = False
 
     rationale: str = ""
     reasoning_model: str | None = None

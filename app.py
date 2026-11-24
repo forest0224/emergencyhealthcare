@@ -1,12 +1,15 @@
 """Streamlit dashboard for the emergency triage prototype."""
 
 import os
+from uuid import uuid4
 
 import httpx
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
+
+from synthetic_patients import CATEGORIES, DemoPatientGenerator
 
 load_dotenv()
 st.set_page_config(page_title="Emergency Healthcare AI", layout="wide")
@@ -27,17 +30,17 @@ VITALS = {
     "spo2": ("Oxygen saturation (%)", 50, 100),
     "pain_score": ("Pain score", 0, 10),
 }
-DEMO = {
-    "age": 45, "gender": "Female", "chief_complaint": "Ankle injury after a fall",
-    "arrival_hour": 14, "systolic_bp": 122, "diastolic_bp": 78, "heart_rate": 86,
-    "respiratory_rate": 16, "temperature": 36.8, "spo2": 98, "pain_score": 5,
-}
+PATIENT_WIDGETS = (
+    "age", "gender", "arrival_hour", "chief_complaint", "encounter_id",
+    "record_type", *VITALS,
+)
 
 
-def request(path, payload=None):
+def request(path, payload=None, *, assessment_headers=None):
     url = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/") + path
     token = os.getenv("FRONTEND_API_TOKEN", "")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers.update(assessment_headers or {})
     response = httpx.request(
         "POST" if payload is not None else "GET", url, json=payload,
         headers=headers, timeout=30 if payload is not None else 3,
@@ -53,18 +56,40 @@ def system_status():
         return None
 
 
-def reset_patient(prefill=None):
+def reset_patient():
     for key in list(st.session_state):
         if key.startswith("patient_") or key in ("result", "submitted_vitals"):
             del st.session_state[key]
-    for field, value in (prefill or {}).items():
-        st.session_state[f"patient_{field}"] = value
+
+
+
+def generate_demo_patient():
+    generator = st.session_state.get("demo_patient_generator")
+    if generator is None:
+        generator = DemoPatientGenerator()
+        st.session_state.demo_patient_generator = generator
+    profile = generator.generate(st.session_state.demo_scenario)
+    reset_patient()
+    st.session_state.update({f"patient_{field}": value for field, value in profile.items()})
+    st.session_state.patient_record_type = "Synthetic Demo"
+    st.session_state.patient_is_demo = True
+    st.session_state.patient_demo_notice = True
 
 
 def patient_form():
     controls = st.columns(2)
-    controls[0].button("Clear patient data and result", on_click=reset_patient)
-    controls[1].button("Load synthetic demo patient", on_click=reset_patient, args=(DEMO,))
+    controls[0].selectbox(
+        "Demo scenario", [None, *CATEGORIES], key="demo_scenario",
+        format_func=lambda category: f"{category} Scenario" if category else "Random Scenario",
+        help="Scenarios set the synthetic inputs. The model predicts acuity from the submitted values.",
+    )
+    controls[1].button("Generate Random Demo Patient", on_click=generate_demo_patient)
+    controls[1].button("Clear patient data and result", on_click=reset_patient)
+    is_demo = st.session_state.get("patient_is_demo", False)
+    if st.session_state.pop("patient_demo_notice", False):
+        st.success("New synthetic patient generated.")
+    if is_demo:
+        st.info("Synthetic Demo Patient")
     with st.form("triage"):
         st.subheader("Patient and arrival")
         cols = st.columns(3)
@@ -74,7 +99,7 @@ def patient_form():
         )
         hour = cols[2].number_input("Arrival hour", 0, 23, value=None, key="patient_arrival_hour")
         complaint = st.text_area("Chief complaint", max_chars=500, key="patient_chief_complaint")
-        encounter = st.text_input("Encounter ID (optional)", max_chars=128, key="patient_encounter")
+        encounter = st.text_input("Encounter ID (optional)", max_chars=128, key="patient_encounter_id")
         st.subheader("Vital signs")
         cols = st.columns(2)
         vitals = {}
@@ -82,6 +107,14 @@ def patient_form():
             vitals[field] = cols[index % 2].number_input(
                 label, low, high, value=None, key=f"patient_{field}"
             )
+        record_type = st.selectbox(
+            "Record type", ["Synthetic Demo", "Authorised patient"],
+            index=None, key="patient_record_type", disabled=is_demo,
+        )
+        writer_token = st.text_input(
+            "Individual writer token (authorised patient records only)",
+            type="password", key="patient_writer_token",
+        )
         mode = st.radio("Assessment mode", ["Fast Prediction", "Detailed Triage"], horizontal=True)
         submitted = st.form_submit_button("Run assessment", type="primary")
     if submitted:
@@ -89,6 +122,8 @@ def patient_form():
         st.session_state.pop("submitted_vitals", None)
         if age is None or not complaint.strip():
             st.error("Enter an age and chief complaint.")
+        elif record_type is None:
+            st.error("Select the record type before saving.")
         else:
             payload = {
                 "age": age, "gender": None if gender == "Not Provided" else gender,
@@ -96,21 +131,33 @@ def patient_form():
                 "encounter_id": encounter.strip() or None, **vitals,
             }
             endpoint = "/v1/triage" if mode == "Detailed Triage" else "/v1/predict"
+            signature = (endpoint, record_type, payload)
+            previous = st.session_state.get("patient_submission")
+            key = previous[1] if previous and previous[0] == signature else str(uuid4())
+            st.session_state.patient_submission = (signature, key)
+            headers = {"Idempotency-Key": key, "X-Record-Type": record_type}
+            if record_type == "Authorised patient" and writer_token:
+                headers["X-Patient-Writer-Token"] = writer_token
             try:
                 with st.spinner("Running assessment…"):
-                    st.session_state.result = request(endpoint, payload)
+                    st.session_state.result = request(endpoint, payload, assessment_headers=headers)
                     st.session_state.submitted_vitals = vitals
             except httpx.HTTPStatusError as exc:
                 messages = {
                     401: "The dashboard could not authenticate with the backend.",
-                    403: "The backend rejected the dashboard credentials.",
+                    403: "Check your individual patient record writer credential.",
+                    409: "This submission is already pending or failed. Clear the form to start a new assessment.",
                     422: "Review the assessment fields and submit again.",
-                    503: "The backend is online. The model is unavailable.",
+                    503: "The model or Excel storage is unavailable. The assessment was not confirmed saved.",
                 }
                 st.error(messages.get(exc.response.status_code, "The assessment failed."))
             except (httpx.HTTPError, ValueError):
                 st.error("The backend did not return an assessment. Check System Status.")
     if result := st.session_state.get("result"):
+        if assessment_id := result.get("assessment_id"):
+            st.success(f"Saved to Excel ? {assessment_id}")
+        if result.get("assessment_replayed"):
+            st.info("Showing the saved assessment. SHAP and narrative are available on the original result.")
         prediction(result)
 
 
@@ -207,24 +254,99 @@ def performance():
     if not report.get("leaderboard"):
         st.info("No evaluation metrics are attached to the loaded model.")
         return
-    st.subheader("Cross-validation leaderboard")
+    st.caption(report.get("dataset_source", "Dataset source unavailable for this artifact"))
+    st.caption(report.get("protocol", "Evaluation protocol unavailable for this artifact"))
+    cards = st.columns(3)
+    cards[0].metric("Selected model", report.get("selected_model", "Unavailable"))
+    cards[1].metric("Held-out cases", report.get("evaluated_rows", "Unavailable"))
+    held_out = report.get("held_out", {})
+    cards[2].metric("Held-out macro F1", f"{held_out['macro_f1']:.4f}"
+                    if "macro_f1" in held_out else "Unavailable")
     frame = pd.DataFrame(report["leaderboard"])
-    st.plotly_chart(px.bar(frame, x="model", y="macro_f1", color_discrete_sequence=["#087f8c"]),
-                    use_container_width=True)
-    st.dataframe(frame, hide_index=True, use_container_width=True)
+    if frame["macro_f1"].max() >= .99:
+        st.warning("Near-perfect results warrant a review of label shortcuts, duplicates, and dataset provenance.")
+    st.subheader("Development cross-validation")
+    frame.insert(0, "rank", range(1, len(frame) + 1))
+    chart = px.bar(frame, x="model", y="macro_f1",
+                   error_y="macro_f1_std" if "macro_f1_std" in frame else None,
+                   color_discrete_sequence=["#087f8c"],
+                   labels={"model": "Model", "macro_f1": "Mean validation macro F1"})
+    st.plotly_chart(chart, use_container_width=True)
+    number_columns = {
+        column: st.column_config.NumberColumn(format="%.4f")
+        for column in frame.select_dtypes(include="float")
+    }
+    st.dataframe(frame, hide_index=True, use_container_width=True, column_config=number_columns)
+    if "baseline_macro_f1" in report:
+        st.caption(f"Most-frequent baseline macro F1 ? {report['baseline_macro_f1']:.4f}")
+    if "training_macro_f1" in frame:
+        st.plotly_chart(px.bar(
+            frame, x="model", y=["training_macro_f1", "macro_f1"], barmode="group",
+            labels={"value": "Macro F1", "variable": "Partition"},
+            title="Training versus validation",
+        ), use_container_width=True)
+        safety_columns = ["acuity1_recall", "critical_miss_rate", "under_triage_rate"]
+        st.plotly_chart(px.bar(
+            frame, x="model", y=safety_columns, barmode="group",
+            labels={"value": "Rate", "variable": "Metric", "model": "Model"},
+            title="Development safety metrics",
+        ), use_container_width=True)
+    if counts := report.get("dataset_audit", {}).get("class_counts"):
+        st.plotly_chart(px.bar(
+            x=[f"ESI {key}" for key in counts], y=list(counts.values()),
+            labels={"x": "Acuity", "y": "Eligible cases"}, title="Dataset class distribution",
+        ), use_container_width=True)
+    st.subheader("Independent held-out evaluation")
     if matrix := report.get("confusion_matrix"):
         labels = [f"ESI {n}" for n in LABELS]
         st.plotly_chart(px.imshow(matrix, x=labels, y=labels, text_auto=True,
                                  labels={"x": "Predicted", "y": "Observed"},
                                  color_continuous_scale="Teal"), use_container_width=True)
-    for field, label in (("held_out", "Held-out evaluation"), ("safety", "Safety metrics"),
+    if per_class := report.get("per_class"):
+        classes = pd.DataFrame(per_class)
+        classes["class"] = classes["class"].map(lambda n: f"ESI {n}")
+        st.plotly_chart(px.bar(
+            classes, x="class", y=["precision", "recall", "f1-score"], barmode="group",
+            hover_data=["support"], labels={"value": "Score", "variable": "Metric"},
+            title="Class precision, recall and F1",
+        ), use_container_width=True)
+        st.dataframe(classes, hide_index=True, use_container_width=True)
+    if learning := report.get("learning_curve"):
+        st.plotly_chart(px.line(
+            learning, x="training_rows", y=["training_macro_f1", "validation_macro_f1"],
+            markers=True, labels={"value": "Macro F1", "variable": "Partition"},
+            title="Learning curve on one fixed development fold",
+        ), use_container_width=True)
+    if calibration := report.get("calibration"):
+        reliability = px.line(
+            calibration["points"], x="probability", y="observed", color="class",
+            line_dash="model", markers=True, title="Held-out probability calibration",
+            labels={"probability": "Mean predicted probability", "observed": "Observed frequency"},
+        )
+        reliability.add_shape(type="line", x0=0, x1=1, y0=0, y1=1, line_dash="dot")
+        st.plotly_chart(reliability, use_container_width=True)
+        st.caption(calibration["method"])
+        st.dataframe(pd.DataFrame({
+            "Base": calibration["uncalibrated"], "Deployed": calibration["deployed"],
+        }), use_container_width=True)
+    if robustness := report.get("robustness"):
+        stress = pd.DataFrame(robustness)
+        st.plotly_chart(px.bar(
+            stress, x="macro_f1", y="scenario", orientation="h", hover_data=["rows"],
+            title="Supplementary stress tests",
+        ), use_container_width=True)
+        st.dataframe(stress, hide_index=True, use_container_width=True)
+    if "protocol" not in report:
+        st.info("Fold variability, learning curves, calibration curves and stress tests are unavailable for this artifact.")
+    for field, label in (("held_out", "Held-out metrics"), ("safety", "Held-out safety metrics"),
                          ("fairness", "Demographic subgroup evaluation")):
         if report.get(field):
-            st.subheader(label)
-            if isinstance(report[field], list):
-                st.dataframe(report[field], hide_index=True, use_container_width=True)
-            else:
-                st.json(report[field], expanded=False)
+            with st.expander(label):
+                data = report[field]
+                if isinstance(data, list):
+                    st.dataframe(data, hide_index=True, use_container_width=True)
+                else:
+                    st.json(data, expanded=False)
 
 
 def status_cards():
@@ -245,6 +367,13 @@ def status_cards():
 
 
 def main():
+    # Keep form values when Streamlit removes widgets on page navigation.
+    for field in PATIENT_WIDGETS:
+        key = f"patient_{field}"
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+    if "demo_scenario" in st.session_state:
+        st.session_state.demo_scenario = st.session_state.demo_scenario
     st.sidebar.title("Emergency Healthcare AI")
     page = st.sidebar.radio("Navigation", PAGES)
     st.sidebar.button("Delete current patient session", on_click=reset_patient)

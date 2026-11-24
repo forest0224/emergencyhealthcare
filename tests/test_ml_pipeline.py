@@ -136,3 +136,58 @@ class TestPIIScrubber:
         from backend.security import scrub_free_text
         text = "chest pain and dyspnoea"
         assert scrub_free_text(text) == text
+
+
+
+def test_group_partitions_keep_identifiers_and_duplicate_profiles_together():
+    from ml.data_quality import evaluation_groups, holdout, split_folds
+    from ml.simulate import simulate
+
+    data = simulate(800, seed=3)
+    data["patient_id"] = data["encounter_id"]
+    data.loc[1, "patient_id"] = data.loc[0, "patient_id"]
+    duplicate = data.iloc[[1]].assign(encounter_id="independent-id", patient_id="another-patient")
+    data = pd.concat([data, duplicate], ignore_index=True)
+    groups = evaluation_groups(data)
+    assert groups[0] == groups[1] == groups[-1]
+    dev, test = holdout(data.acuity_target, groups)
+    assert len(dev) + len(test) == len(data)
+    assert not set(groups[dev]) & set(groups[test])
+    for train, validation in split_folds(data.acuity_target.iloc[dev], groups[dev]):
+        assert not set(groups[dev][train]) & set(groups[dev][validation])
+
+
+def test_preprocessing_ignores_complaint_target_and_extra_columns():
+    from ml.preprocessing import fit_features, transform_features
+    from ml.simulate import simulate
+
+    data = simulate(400, seed=8)
+    features, _, meta = fit_features(data.iloc[:300])
+    assert not {"acuity_target", "encounter_id", "chief_complaint_enc"} & set(features)
+    validation = data.iloc[300:].copy()
+    original = transform_features(validation, meta)
+    validation["acuity_target"] = 4
+    validation["chief_complaint"] = "different complaint"
+    validation["post_treatment_value"] = 1000000
+    pd.testing.assert_frame_equal(original, transform_features(validation, meta))
+
+
+def test_simulator_uses_overlapping_complaints_and_respects_input_ranges():
+    from ml.preprocessing import INPUT_BOUNDS
+    from ml.simulate import simulate
+
+    frame = simulate(1000)
+    assert frame.groupby("chief_complaint").acuity_target.nunique().eq(4).all()
+    assert frame.isna().any().any()
+    assert frame.encounter_id.is_unique
+    for name, bounds in INPUT_BOUNDS.items():
+        assert frame[name].dropna().between(*bounds).all()
+    measured = frame.dropna(subset=["systolic_bp", "diastolic_bp"])
+    assert measured.systolic_bp.gt(measured.diastolic_bp).all()
+
+
+
+def test_ece_includes_probability_one():
+    from ml.safety_metrics import binary_ece
+
+    assert binary_ece(np.array([0]), np.array([1.0])) == 1.0

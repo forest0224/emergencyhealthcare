@@ -11,7 +11,7 @@ import pytest
 
 os.environ.setdefault("API_TOKENS", "test-tok,test-admin")
 os.environ.setdefault("ADMIN_TOKENS", "test-admin")
-os.environ.setdefault("MODEL_DIR", "ml_runs")
+os.environ.setdefault("MODEL_DIR", "models")
 
 
 # ---------------------------------------------------------------------------
@@ -188,3 +188,40 @@ def test_pii_scrubber_removes_phi():
     result = scrub_free_text("Dr. Smith MRN 12345")
     assert "Smith" not in result
     assert "12345" not in result
+
+
+
+def test_excel_assessment_replays_and_marks_failure(client, monkeypatch, tmp_path):
+    from uuid import uuid4
+    from backend import main
+    from openpyxl import load_workbook
+
+    workbook = tmp_path / "assessments.xlsx"
+    monkeypatch.setenv("PATIENT_RECORDS_PATH", str(workbook))
+    headers = {**_AUTH, "Idempotency-Key": str(uuid4()), "X-Record-Type": "Synthetic Demo"}
+    patient = {"age": 44, "chief_complaint": "=example"}
+    first = client.post("/v1/triage", json=patient, headers=headers)
+    assert first.status_code == 200
+    replay = client.post("/v1/triage", json=patient, headers=headers)
+    assert replay.json()["assessment_id"] == first.json()["assessment_id"]
+    assert replay.json()["assessment_replayed"] is True
+    assert client.post("/v1/triage", json={**patient, "age": 45}, headers=headers).status_code == 409
+
+    headers.update({"Idempotency-Key": str(uuid4()), "X-Record-Type": "Authorised patient"})
+    assert client.post("/v1/predict", json=patient, headers=headers).status_code == 403
+    monkeypatch.setenv("PATIENT_RECORD_WRITERS", '{"clinician":"personal-token"}')
+    headers["X-Patient-Writer-Token"] = "personal-token"
+    monkeypatch.setattr(main, "_triage_model", None)
+    assert client.post("/v1/predict", json=patient, headers=headers).status_code == 503
+
+    book = load_workbook(workbook)
+    try:
+        completed, failed = list(book["Patient Records"].values)[1:]
+        assert completed[0] == first.json()["assessment_id"]
+        assert completed[7] == "'=example"
+        assert completed[8] is None
+        assert completed[-2:] == ("Completed", "Synthetic Demo")
+        assert failed[15:25] == (None,) * 10
+        assert failed[-2:] == ("Failed", "Authorised patient")
+    finally:
+        book.close()

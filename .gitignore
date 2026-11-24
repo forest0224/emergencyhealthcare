@@ -93,3 +93,7 @@ $RECYCLE.BIN/
 .streamlit/secrets.toml
 models/*
 !models/.gitkeep
+
+# Private patient assessment workbook and lock
+/data/*.xlsx
+/data/*.xlsx.lock

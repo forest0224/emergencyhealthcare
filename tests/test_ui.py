@@ -27,7 +27,7 @@ def test_assessment_and_session(monkeypatch):
     app.sidebar.radio[0].set_value("Patient Triage").run()
     next(button for button in app.button if button.label == "Run assessment").click().run()
     assert "chief complaint" in app.error[0].value
-    next(button for button in app.button if button.label == "Load synthetic demo patient").click().run()
+    next(button for button in app.button if button.label == "Generate Random Demo Patient").click().run()
     next(radio for radio in app.radio if radio.label == "Assessment mode").set_value("Detailed Triage")
     next(button for button in app.button if button.label == "Run assessment").click().run()
     assert not app.exception
@@ -50,3 +50,33 @@ def test_backend_offline(monkeypatch):
     app = AppTest.from_file("app.py").run()
     assert not app.exception
     assert app.metric[0].value == "Unavailable"
+
+
+
+def test_demo_generation_is_explicit_and_profile_survives_navigation(monkeypatch):
+    def backend(method, url, **kwargs):
+        assert method == "GET", "Generating a profile must not submit an assessment"
+        return httpx.Response(200, json={}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx, "request", backend)
+    app = AppTest.from_file("app.py").run()
+    app.sidebar.radio[0].set_value("Patient Triage").run()
+    button = lambda: next(b for b in app.button if b.label == "Generate Random Demo Patient")
+    app.session_state["result"] = {"shap_top": {"1": []}, "rationale": "Previous"}
+    button().click().run()
+    assert not app.exception
+    assert "result" not in app.session_state
+    assert any(message.value == "Synthetic Demo Patient" for message in app.info)
+    assert any(message.value == "New synthetic patient generated." for message in app.success)
+    assert app.number_input(key="patient_age").value is not None
+    first = app.text_area(key="patient_chief_complaint").value
+    encounter = app.text_input(key="patient_encounter_id").value
+    assert encounter.startswith("DEMO-")
+    app.sidebar.radio[0].set_value("Home").run()
+    app.sidebar.radio[0].set_value("Patient Triage").run()
+    assert app.text_input(key="patient_encounter_id").value == encounter
+    assert app.text_area(key="patient_chief_complaint").value == first
+    button().click().run()
+    assert not app.exception
+    assert app.text_area(key="patient_chief_complaint").value != first
+    assert app.text_input(key="patient_encounter_id").value != encounter

@@ -41,7 +41,7 @@ _HIGH_ACUITY = {1, 2}
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _ece(y_true_bin: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> float:
+def binary_ece(y_true_bin: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> float:
     """Expected Calibration Error (ECE) for a single class.
 
     Args:
@@ -53,13 +53,14 @@ def _ece(y_true_bin: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> float
         ECE float.
 
     Example:
-        >>> err = _ece(y_bin[:, 0], y_proba[:, 0])
+        >>> err = binary_ece(y_bin[:, 0], y_proba[:, 0])
     """
     bins = np.linspace(0.0, 1.0, n_bins + 1)
     ece_val = 0.0
     n = len(y_true_bin)
     for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (y_proba >= lo) & (y_proba < hi)
+        upper = y_proba <= hi if hi == 1.0 else y_proba < hi
+        mask = (y_proba >= lo) & upper
         if mask.sum() == 0:
             continue
         acc  = float(y_true_bin[mask].mean())
@@ -149,7 +150,7 @@ def compute_safety_metrics(
         lb = LabelBinarizer()
         lb.fit(CLASSES)
         y_bin = lb.transform(yt)
-        ece_vals    = [_ece(y_bin[:, i], proba[:, i]) for i in range(4)]
+        ece_vals    = [binary_ece(y_bin[:, i], proba[:, i]) for i in range(4)]
         brier_vals  = [brier_score_loss(y_bin[:, i], proba[:, i]) for i in range(4)]
         ece_macro   = float(np.mean(ece_vals))
         brier_macro = float(np.mean(brier_vals))

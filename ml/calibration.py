@@ -24,6 +24,8 @@ import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import LabelBinarizer
 
+from ml.safety_metrics import binary_ece
+
 CLASSES      = [1, 2, 3, 4]
 RANDOM_STATE = 42
 
@@ -54,24 +56,10 @@ def _ece_multiclass(
     lb.fit(CLASSES)
     y_bin = lb.transform(y_true)
 
-    bins  = np.linspace(0.0, 1.0, n_bins + 1)
-    ece_per_class: list[float] = []
-    n = len(y_true)
-
-    for cls_idx in range(y_bin.shape[1]):
-        yt_bin = y_bin[:, cls_idx]
-        yp_col = y_proba[:, cls_idx]
-        ece_val = 0.0
-        for lo, hi in zip(bins[:-1], bins[1:]):
-            mask = (yp_col >= lo) & (yp_col < hi)
-            if mask.sum() == 0:
-                continue
-            acc  = float(yt_bin[mask].mean())
-            conf = float(yp_col[mask].mean())
-            ece_val += (mask.sum() / n) * abs(acc - conf)
-        ece_per_class.append(ece_val)
-
-    return float(np.mean(ece_per_class))
+    return float(np.mean([
+        binary_ece(y_bin[:, i], y_proba[:, i], n_bins)
+        for i in range(y_bin.shape[1])
+    ]))
 
 
 def _get_proba(model, X: np.ndarray) -> np.ndarray:
@@ -107,6 +95,8 @@ def calibrate(
     X_val: pd.DataFrame | np.ndarray,
     y_val: pd.Series | np.ndarray,
     method: str = "isotonic",
+    *,
+    always_fit: bool = False,
 ) -> object:
     """Calibrate model probabilities and return the better-calibrated version.
 
@@ -160,10 +150,10 @@ def calibrate(
     ece_after   = _ece_multiclass(evaluation_labels, proba_after)
     print(f"[calibration] ECE after  ({method}): {ece_after:.5f}")
 
-    if ece_after < ece_before:
+    if always_fit or ece_after < ece_before:
         print(
             f"[calibration] Calibrated model selected "
-            f"(ECE reduced by {ece_before - ece_after:.5f})."
+            f"(calibration-set ECE change {ece_after - ece_before:+.5f})."
         )
         return cal
     else:

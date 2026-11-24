@@ -1,6 +1,7 @@
 **
 !requirements.txt
 !app.py
+!synthetic_patients.py
 !backend/
 !backend/*.py
 !ml/

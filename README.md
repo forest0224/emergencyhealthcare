@@ -20,7 +20,9 @@ flowchart LR
 - `app.py` handles navigation, form validation, plots and per-session results.
 - `backend/` contains API routes, schemas, auth, governance and reasoning.
 - `ml/` contains preprocessing, model fitting, prediction, calibration, safety, fairness, registry and drift tooling.
-- `data/dataset.csv` contains the existing dataset. `models/` holds generated artifacts.
+- `data/` contains the original and simulated datasets, plus the local Excel workbook after assessments are saved.
+- `models/` holds active model artifacts. `outputs/` holds local evaluations, archives and audit records.
+- `logs/` holds local service logs. `.venv311/` is the local Python environment.
 - `tests/` covers the API, ML, validation, reasoning and dashboard.
 
 ## Local execution
@@ -56,11 +58,27 @@ In a second terminal, run `streamlit run app.py`. The dashboard is at http://loc
 
 The CSV contains encounter identifiers, age, recorded gender, chief complaint, arrival hour, blood pressure, heart and respiratory rates, temperature, oxygen saturation, pain, and the acuity target. Training excludes validation encounters prefixed with `VT`. The original data card leaves provenance, collection dates and geography unverified. The prototype supports four classes from Critical through Less Urgent. Standard ESI has five levels.
 
-Candidates are XGBoost, LightGBM, CatBoost, logistic regression and an MLP. Training fits preprocessing within training folds, including MICE and complaint encoding. Model selection uses stratified cross-validation macro F1. A separate split is used to attempt probability calibration and an independent split supplies held-out metrics. The model directory contains the fitted artifacts, evaluation report, and feature drift reference. Use trusted artifacts only. Legacy local artifacts can load from `ml_runs`; retrain to obtain versioned evaluation and shared fitted preprocessing.
+Candidates are XGBoost, LightGBM, CatBoost, logistic regression and an MLP. The pipeline reserves approximately 20% for an independent test before fitting. It groups repeated patient or encounter identifiers when present and duplicate model inputs, then uses five group-disjoint stratified development folds. Each fold fits its own MICE and other fitted transforms. The model and regularization configuration are selected on development macro F1. The leaderboard shows development selection scores; the held-out report estimates performance of the selected model on the same data source. The selected classifier is refit on one development subset and sigmoid calibration uses a separate development subset. The final test does not inform tuning or calibration. Technical safety and fairness metrics are descriptive.
 
-The original project flags single-snapshot measurements and sparse critical cases as limitations. Historical safety review targets were ESI 1 recall of at least 0.80 and a critical miss rate of at most 0.02. These targets do not establish clinical readiness.
+The supplied CSV has unverified provenance. An audit found that every normalized complaint in the eligible cohort corresponded to exactly one recorded label. The old complaint target encoding could therefore act as a label lookup. New training excludes that encoding, target values, identifiers and other non-allowlisted fields. Chief complaint remains available for clinical reasoning. The original CSV is preserved. The source has no patient identifier or full timestamp, so patient-level dependence across distinct encounters and temporal generalization cannot be assessed.
 
-The Model Performance page reports actual artifact metrics, including cross-validation results and available held-out safety and subgroup metrics. The supplied data has 28 distinct normalised complaints, each associated with a single acuity label. Internal row splits can repeat these complaint categories and overstate generalisation to unseen complaints. The supplied data also contains duplicate feature rows. These are internal estimates. External validation, prospective evaluation, fairness across unrecorded groups, and real clinical readiness remain future work.
+The Model Performance page reads saved metrics for the loaded model. Evaluation JSON includes the full schema audit, missingness, bounds violations, correlations, class-wise quantiles, fold metrics, confusion matrix, probability calibration, fairness, and robustness. FastAPI loads the artifact directory configured by `MODEL_DIR` (default `models/`). To use an archive intentionally, set `MODEL_DIR` to that trusted directory. Retrain legacy artifacts to replace the label shortcut.
+
+### Separate simulation experiment
+
+`data/synthetic_triage_v1.csv` is a reproducible 6,000-row experiment. The generator samples latent simulated labels before producing overlapping presentations, correlated vitals, measurement variation, and missingness. Labels represent simulator design choices. The experiment neither replaces the original data nor supplies clinician-validated outcomes.
+
+```bash
+python -m ml.simulate --output data/synthetic_triage_v1_regenerated.csv
+python -m ml.train --dataset data/synthetic_triage_v1.csv --source "Synthetic experiment v1 (simulated labels)" --output-dir outputs/sim-v1
+```
+
+### External validation data
+
+- MIMIC-IV-ED v2.2 has de-identified triage-time complaints, numeric vitals, pain scores, stay and subject identifiers, and five-level clinician acuity. Its credentialed license requires PhysioNet credentials, designated CITI training and a signed data-use agreement. Missing fields and the five-versus-four-class mismatch need explicit handling, and grouping must use subject ID. No files were downloaded. [PhysioNet dataset and license](https://physionet.org/content/mimic-iv-ed/2.2/)
+- The 2022 NHAMCS public-use ED survey has initial vitals and triage immediacy. Its un-imputed immediacy field has 27.8% nonresponse in the documented denominator. Survey design and weighting, label comparability, and missingness require analysis. CDC limits public-use data to statistical analysis and reporting and prohibits identification attempts or linkage with individually identifiable data. No files were downloaded. [CDC documentation](https://ftp.cdc.gov/pub/Health_Statistics/NCHS/dataset_documentation/nhamcs/doc22-ed-508.pdf) ? [CDC data-use agreement](https://www.cdc.gov/nchs/policy/data-user-agreement.html)
+
+Clinical validation requires authorised clinician-labelled cohorts, a documented label mapping, patient-grouped and temporal or external site holdouts, adequate critical-class support, uncertainty and subgroup analysis, and prospective workflow evaluation.
 
 SHAP explains the underlying classifier score for each available class. When calibration is applied, SHAP still explains the base classifier. Attribution is model behaviour and does not establish medical causation. Missing inputs are reported separately from observed inputs.
 
@@ -98,3 +116,31 @@ python -m pip check
 ```
 
 Automated reasoning tests mock the OpenAI SDK. No live key is needed.
+
+## Excel assessment recording
+
+Submitting the Streamlit triage form saves an assessment in
+`data/patient_records.xlsx` (worksheet `Patient Records`). The backend creates
+a Pending row and updates it to Completed or Failed. Keep the workbook closed
+in Excel while saving on Windows. A service interruption may leave a Pending
+row for review. Records and timestamps use UTC. Encounter IDs are hashed and
+complaints are scrubbed before storage. Use a private, access-controlled
+directory for this file and its backups.
+
+Generate Random Demo Patient loads an editable scenario into the form.
+Scenario categories guide generation and the model determines predicted acuity.
+Only submitted assessments are saved. Use Synthetic Demo for demonstration inputs only. To record an authorised patient,
+set the backend variable `PATIENT_RECORD_WRITERS` to a JSON object mapping
+individual writer names to unique high-entropy credentials, separate from
+the shared inference tokens. Select Authorised patient and provide the
+assigned writer credential in the form. Keep pattern-based scrubbing
+limitations in mind and avoid entering identifiers into free-text fields.
+
+API clients may opt in using a UUID `Idempotency-Key` and an `X-Record-Type`
+header with value `Synthetic Demo` or `Authorised patient`. The API also accepts
+the legacy `Synthetic` value for existing clients. Authorised patient
+requests additionally require `X-Patient-Writer-Token`. An identical retry
+returns the stored prediction and ID without generating another assessment.
+SHAP and generated narrative are returned with the original result only.
+`PATIENT_RECORDS_PATH` configures storage. In Compose the workbook lives in
+the API's persistent outputs volume.

@@ -24,6 +24,7 @@ from ml.preprocessing import (
     CLASSES,
     GENDER_MAP,
     MICE_COLS,
+    clean_triage_inputs,
     transform_features,
 )
 
@@ -48,7 +49,10 @@ def build_single_row(patient: dict, meta: dict) -> tuple[pd.DataFrame, list[str]
     ]
 
     if "outlier_bounds" in meta:
-        return transform_features(pd.DataFrame([d]), meta), imputed_fields
+        frame = pd.DataFrame([d])
+        cleaned = clean_triage_inputs(frame, meta["outlier_bounds"])
+        imputed_fields = [field for field in MICE_COLS if pd.isna(cleaned[field].iat[0])]
+        return transform_features(frame, meta), imputed_fields
 
     for c in MICE_COLS:
         if c not in d or d[c] is None:
@@ -167,21 +171,13 @@ class TriageModel:
 
     def __init__(self, model_dir: str = "models") -> None:
         mdir = Path(model_dir)
-        # Check primary dir and fallback to ml_runs
         model_path = mdir / "best_model.pkl"
-        meta_path  = mdir / "feature_meta.pkl"
-
-        if not model_path.exists() or not meta_path.exists():
-            alt_dir = Path("ml_runs")
-            if (alt_dir / "best_model.pkl").exists() and (alt_dir / "feature_meta.pkl").exists():
-                mdir = alt_dir
-                model_path = mdir / "best_model.pkl"
-                meta_path = mdir / "feature_meta.pkl"
-            else:
-                raise FileNotFoundError(
-                    f"Model artifacts not found in '{model_dir}' or 'ml_runs'. "
-                    "Run `python -m ml.train` first to train the model."
-                )
+        meta_path = mdir / "feature_meta.pkl"
+        if not model_path.is_file() or not meta_path.is_file():
+            raise FileNotFoundError(
+                f"Model artifacts not found in '{mdir}'. "
+                "Run `python -m ml.train` or set MODEL_DIR to a trusted artifact directory."
+            )
 
         self._model = joblib.load(model_path)
         self._meta  = joblib.load(meta_path)
@@ -243,11 +239,20 @@ class TriageModel:
                 try:
                     self._explainer = _shap.LinearExplainer(estimator, np.zeros((1, X.shape[1])))
                 except Exception as exc:
-                    warnings.warn(f"[warn] Could not build SHAP explainer: {exc}", stacklevel=2)
-                    return {}
+                    try:
+                        self._explainer = _shap.Explainer(
+                            estimator.predict_proba, np.zeros((1, X.shape[1])),
+                            algorithm="permutation", seed=42,
+                        )
+                    except Exception:
+                        warnings.warn(f"[warn] Could not build SHAP explainer: {exc}", stacklevel=2)
+                        return {}
 
         try:
-            shap_values = self._explainer.shap_values(X)
+            if hasattr(self._explainer, "shap_values"):
+                shap_values = self._explainer.shap_values(X)
+            else:
+                shap_values = self._explainer(X, max_evals=2 * X.shape[1] + 1).values
         except Exception as exc:
             warnings.warn(f"[warn] SHAP computation failed: {exc}", stacklevel=2)
             return {}

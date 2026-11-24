@@ -191,3 +191,38 @@ def test_ece_includes_probability_one():
     from ml.safety_metrics import binary_ece
 
     assert binary_ece(np.array([0]), np.array([1.0])) == 1.0
+
+
+
+def test_multiclass_shap_normalization_rejects_ambiguous_output():
+    from ml.predict import _class_attributions
+
+    values = np.arange(12, dtype=float).reshape(1, 3, 4)
+    legacy = [values[:, :, index] for index in range(4)]
+    assert np.array_equal(_class_attributions(values, 3, 4), values[0].T)
+    assert np.array_equal(_class_attributions(legacy, 3, 4), values[0].T)
+    with pytest.raises(ValueError):
+        _class_attributions(values[0], 3, 4)
+
+
+
+def test_shap_uses_estimator_class_order_and_filters_nonfinite_values(monkeypatch):
+    from types import SimpleNamespace
+
+    from ml import predict
+
+    monkeypatch.setattr(predict, "_HAS_SHAP", True)
+    monkeypatch.setattr(predict, "build_single_row",
+                        lambda patient, meta: (pd.DataFrame([[64., 90.]]), []))
+    model = predict.TriageModel.__new__(predict.TriageModel)
+    model._meta = {"feature_names": ["age", "heart_rate"]}
+    model._explanation_model = SimpleNamespace(classes_=[2, 0, 3, 1])
+    model._label_imap = {0: 1, 1: 2, 2: 3, 3: 4}
+    model._explainer = SimpleNamespace(shap_values=lambda inputs: np.array(
+        [[[0.3, 0.1, 0.4, 0.2], [np.inf, -0.5, -0.7, -0.8]]]
+    ))
+    result = model.explain({})
+    assert result["3"] == [{"feature": "age", "shap_value": 0.3}]
+    assert result["1"][0] == {"feature": "heart_rate", "shap_value": -0.5}
+    assert result["4"][0] == {"feature": "heart_rate", "shap_value": -0.7}
+    assert result["2"][0] == {"feature": "heart_rate", "shap_value": -0.8}

@@ -1,0 +1,112 @@
+:root {
+  --background:#e7edf5; --surface:#f4f7fb; --primary:#168b9c;
+  --secondary:#3b82f6; --text:#172b4d; --muted:#52647a;
+  --shadow-dark:#c5cedb; --shadow-light:#fff; --purple:#ddd6fe; --mint:#cdede3;
+  --teal-ink:#0f766e; --boundary:#71859D; --focus:#1258a7;
+  --raised:2px 3px 8px #c5cedb66, -2px -2px 7px #ffffffa6;
+  --inset:inset 2px 3px 5px #c5cedb96, inset -2px -2px 6px #fff;
+}
+[data-testid="stAppViewContainer"] {background:var(--background);}
+[data-testid="stHeader"] {background:var(--background);}
+[data-testid="stMainBlockContainer"] {max-width:1440px;padding:2.9rem 1.75rem 1.75rem;}
+[data-testid="stSidebar"] {
+  background:var(--surface); border-right:1px solid #d1dae6;
+  box-shadow:4px 0 14px #a8b5c333;
+}
+[data-testid="stSidebar"] [data-testid="stSidebarContent"] {padding:0 .4rem;}
+[data-testid="stSidebar"] [role="radiogroup"] {gap:.4rem;}
+[data-testid="stSidebar"] [role="radiogroup"] label {
+  width:100%;min-height:2.05rem; padding:.26rem .55rem; margin:0; border-radius:11px;
+  background:var(--surface); box-shadow:var(--raised);
+  color:var(--text); border:1px solid transparent;
+  transition:background-color .16s,border-color .16s;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {
+  position:absolute; opacity:0; width:1px; height:1px; overflow:hidden;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+  color:var(--teal-ink); background:#dde7f1; box-shadow:var(--inset);
+  border:1px solid #a6bdcc; border-left:3px solid var(--teal-ink); font-weight:700;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {border-color:var(--boundary);}
+.st-key-brand {margin-bottom:.25rem;}
+.brand-lockup {display:flex;align-items:center;gap:.72rem;}
+.brand-symbol {
+  background:var(--mint);color:var(--teal-ink);width:2.45rem;height:2.45rem;
+  flex:none;display:grid;place-items:center;border-radius:.75rem;font-size:1.55rem;font-weight:750;
+}
+.brand-lockup strong {font-size:.97rem;line-height:1.1;display:block;}
+.brand-lockup small {font-size:.72rem;color:var(--muted);display:block;margin-top:.22rem;}
+.st-key-hero {
+  background:var(--surface);box-shadow:var(--raised);border:1px solid #f7f9fc;
+  border-radius:14px;padding:1.05rem 1.15rem;
+}
+[data-testid="stMainBlockContainer"] h1 {font-size:clamp(1.7rem, 2vw, 2rem);letter-spacing:-.025em;}
+[data-testid="stMainBlockContainer"] h2, [data-testid="stMainBlockContainer"] h3 {font-size:1.25rem;}
+[data-testid="stMainBlockContainer"] p {font-size:.94rem;}
+@media(min-width:1000px) {
+  [data-testid="stSidebar"][aria-expanded="true"] {width:250px!important;min-width:250px!important;max-width:250px!important;}
+}
+.st-key-hero [data-testid="stCaptionContainer"] {color:var(--muted);}
+.st-key-home_actions {border-radius:14px;background:#e1eee9;padding:.9rem;}
+[data-testid="stMetric"],
+[data-testid="stVerticalBlock"][class*="st-key-card_"] {
+  background:var(--surface);border-radius:15px;box-shadow:var(--raised);
+}
+[data-testid="stMetric"] {border:1px solid #f7fafe; padding:.5rem .75rem;}
+[data-testid="stMetricValue"] {font-variant-numeric:tabular-nums;font-size:1.2rem;}
+[data-testid="stMetricLabel"] {white-space:normal;}
+[data-testid="stVerticalBlock"][class*="st-key-card_"] {padding:.9rem 1.05rem;}
+[data-testid="stForm"] {border:none;padding:0;}
+[data-testid="stAppViewContainer"] [data-baseweb="input"],
+[data-testid="stAppViewContainer"] [data-baseweb="textarea"],
+[data-testid="stAppViewContainer"] [data-baseweb="select"] > div:first-child {
+  background:var(--background);color:var(--text);border:1px solid var(--boundary);
+  border-radius:10px;box-shadow:var(--inset);
+}
+[data-testid="stAppViewContainer"] input, [data-testid="stAppViewContainer"] textarea {
+  background:transparent;color:var(--text);min-height:2.5rem;
+}
+[data-testid="stAppViewContainer"] button[kind="secondary"] {
+  background:var(--surface);color:var(--teal-ink);border:1px solid var(--boundary);
+  border-radius:10px;box-shadow:var(--raised);font-weight:600;
+}
+[data-testid="stAppViewContainer"] button[kind="primary"], [data-testid="stAppViewContainer"] button[kind="primaryFormSubmit"] {
+  background:var(--teal-ink);color:#fff;border:1px solid var(--teal-ink);
+  border-radius:10px;box-shadow:var(--raised);font-weight:650;
+}
+[data-testid="stAppViewContainer"] button:hover:not(:disabled) {filter:brightness(.96);}
+:where(button,a,input,select,textarea,[role="tab"],[role="combobox"]):focus-visible,
+[data-testid="stSidebar"] label:has(input:focus-visible),
+[data-baseweb="input"]:focus-within,[data-baseweb="select"] > div:first-child:focus-within,
+[data-baseweb="textarea"]:focus-within {outline:2px solid var(--focus)!important;outline-offset:2px;}
+[data-testid="stPlotlyChart"] {
+  border-radius:12px;background:var(--surface);min-width:0;
+}
+[data-testid="stDataFrame"] {border-radius:10px;}
+[data-testid="stCaptionContainer"], [data-testid="stMarkdownContainer"] {overflow-wrap:anywhere;}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {color:var(--muted)!important;opacity:1!important;}
+[data-baseweb="base-input"]:focus-within,
+[data-testid="stAppViewContainer"] input:focus-visible,
+[data-testid="stAppViewContainer"] textarea:focus-visible {outline:2px solid var(--focus)!important;outline-offset:2px;}
+[data-testid="stText"] {white-space:pre-wrap;overflow-wrap:anywhere;}
+[data-testid="stMetricValue"] > div {overflow-wrap:anywhere;}
+.severity {display:inline-block;border-radius:7px;padding:.18rem .55rem;
+  border-left:4px solid var(--severity);background:#f7fafe;color:var(--text);font-weight:700;}
+@media(max-width:900px) {
+  [data-testid="stMainBlockContainer"] {padding-left:1.4rem;padding-right:1.4rem;}
+  .st-key-card_vitals [data-testid="stHorizontalBlock"] {flex-wrap:wrap;}
+  .st-key-card_vitals [data-testid="stColumn"] {flex:1 1 43%;min-width:0;}
+}
+@media(max-width:620px) {
+  [data-testid="stMainBlockContainer"] {padding:3rem .85rem 1.75rem;}
+  [data-testid="stMainBlockContainer"] [data-testid="stHorizontalBlock"] {flex-wrap:wrap;}
+  [data-testid="stMainBlockContainer"] [data-testid="stColumn"] {flex:1 1 100%;min-width:0;}
+  .st-key-hero {padding:1rem;}
+}
+@media(prefers-reduced-motion:reduce) {
+  [data-testid="stAppViewContainer"] *, [data-testid="stSidebar"] * {transition:none!important;animation:none!important;}
+}
+
+[data-testid="stTabs"] [role="tablist"] {gap:.45rem;flex-wrap:wrap;}
+[data-testid="stTabs"] [role="tab"] {white-space:normal;min-height:2.25rem;}

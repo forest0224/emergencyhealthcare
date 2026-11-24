@@ -186,6 +186,7 @@ class TriageModel:
         self._model_dir = mdir
         self._label_imap: dict[int, int] = self._meta.get("label_imap", {i: i + 1 for i in range(4)})
         self._explainer: Any = None
+        self.shap_output: str | None = None
 
     @property
     def model_name(self) -> str:
@@ -234,48 +235,57 @@ class TriageModel:
             estimator = estimator.steps[-1][1]
         if self._explainer is None:
             try:
-                self._explainer = _shap.TreeExplainer(estimator)
+                explainer = _shap.TreeExplainer(estimator)
+                score = "Uncalibrated raw model score"
             except Exception:
                 try:
-                    self._explainer = _shap.LinearExplainer(estimator, np.zeros((1, X.shape[1])))
-                except Exception as exc:
+                    explainer = _shap.LinearExplainer(estimator, np.zeros((1, X.shape[1])))
+                    score = "Uncalibrated linear decision score (log-odds units)"
+                except Exception:
                     try:
-                        self._explainer = _shap.Explainer(
+                        explainer = _shap.Explainer(
                             estimator.predict_proba, np.zeros((1, X.shape[1])),
                             algorithm="permutation", seed=42,
                         )
-                    except Exception:
+                        score = "Uncalibrated base-model probability"
+                    except Exception as exc:
                         warnings.warn(f"[warn] Could not build SHAP explainer: {exc}", stacklevel=2)
                         return {}
+            self.shap_output = score
+            self._explainer = explainer
 
         try:
             if hasattr(self._explainer, "shap_values"):
                 shap_values = self._explainer.shap_values(X)
             else:
                 shap_values = self._explainer(X, max_evals=2 * X.shape[1] + 1).values
+
+            feature_names = self._meta["feature_names"]
+            classes = [self._label_imap.get(int(cls), int(cls)) for cls in estimator.classes_]
+            values = _class_attributions(shap_values, len(feature_names), len(classes))
         except Exception as exc:
             warnings.warn(f"[warn] SHAP computation failed: {exc}", stacklevel=2)
             return {}
 
-        feature_names = self._meta["feature_names"]
-        result: dict[str, list[dict[str, Any]]] = {}
-
-        if isinstance(shap_values, list):
-            class_shaps = shap_values
-        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
-            class_shaps = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
-        else:
-            class_shaps = [shap_values]
-
-        for cls_idx, cls_label in enumerate(CLASSES):
-            if cls_idx >= len(class_shaps):
-                break
-            sv = np.asarray(class_shaps[cls_idx]).flatten()
-            order = np.argsort(np.abs(sv))[::-1][:top_k]
-            result[str(cls_label)] = [
-                {"feature": feature_names[i], "shap_value": float(sv[i])}
-                for i in order
-                if i < len(feature_names)
-            ]
-
+        result = {}
+        for cls, contributions in zip(classes, values):
+            if cls not in CLASSES:
+                continue
+            finite = np.flatnonzero(np.isfinite(contributions))
+            ordered = finite[np.argsort(-np.abs(contributions[finite]), kind="stable")][:top_k]
+            if len(ordered):
+                result[str(cls)] = [
+                    {"feature": feature_names[i], "shap_value": float(contributions[i])}
+                    for i in ordered
+                ]
         return result
+
+
+def _class_attributions(values, features, classes):
+    """Normalize SHAP output to (class, feature) for one observation."""
+    array = np.asarray(values, dtype=float)
+    if isinstance(values, list) and array.shape == (classes, 1, features):
+        return array[:, 0, :]
+    if array.shape == (1, features, classes):
+        return array[0].T
+    raise ValueError(f"Unexpected multiclass SHAP shape {array.shape}.")

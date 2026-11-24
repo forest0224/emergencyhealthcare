@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 import os
 import time
@@ -17,22 +16,18 @@ from backend.security import append_audit, hash_patient_id
 from backend.reasoning import rule_based_rationale
 from backend.security import scrub_free_text
 from backend.reasoning import ClinicalReasonerError
-from backend.patient_records import PROBABILITIES, PatientRecords, RecordConflict
 from backend.schemas import ErrorOut, PatientIn, PredictionOut, RationaleOut
 
-import logging
-import os
-import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from dotenv import load_dotenv
 from starlette.concurrency import run_in_threadpool
 
-from ml.predict import TriageModel
+from ml.predict import TriageModel, _HAS_SHAP
 from backend.reasoning import ClinicalReasoner
 
 load_dotenv()
@@ -444,14 +439,6 @@ async def predict(
     patient:    PatientIn,
     token_info: TokenInfo = Depends(require_role("infer")),
 ) -> PredictionOut:
-    return await _record_assessment(request, patient, token_info, _predict)
-
-
-async def _predict(
-    request:    Request,
-    patient:    PatientIn,
-    token_info: TokenInfo,
-) -> PredictionOut:
     """ML-only fast-path prediction endpoint.
 
     Does not invoke the LLM.  Returns probability, predicted acuity,
@@ -519,6 +506,7 @@ async def _predict(
         confidence     =ml_out["confidence"],
         imputed_fields =ml_out.get("imputed_fields", []),
         shap_top       =shap_raw,
+        shap_output    =getattr(_triage_model, "shap_output", None) if shap_raw else None,
         safety_flags   =flags,
         model_version  =model_ver,
         latency_ms     =latency_ms,
@@ -530,14 +518,6 @@ async def triage(
     request:    Request,
     patient:    PatientIn,
     token_info: TokenInfo = Depends(require_role("infer")),
-) -> RationaleOut:
-    return await _record_assessment(request, patient, token_info, _triage)
-
-
-async def _triage(
-    request:    Request,
-    patient:    PatientIn,
-    token_info: TokenInfo,
 ) -> RationaleOut:
     """Full triage endpoint: ML + SHAP + LLM clinical rationale.
 
@@ -638,6 +618,7 @@ async def _triage(
         proba             =proba_dict,
         imputed_fields    =ml_out.get("imputed_fields", []),
         shap_top          =shap_raw,
+        shap_output       =getattr(_triage_model, "shap_output", None) if shap_raw else None,
         safety_flags      =flags,
         model_version     =model_ver,
         latency_ms        =latency_ms,
@@ -651,97 +632,6 @@ async def _triage(
         llm_backend       =llm_result.get("llm_backend", "rule_based"),
     )
 
-
-
-async def _record_assessment(request, patient, token, assess):
-    """Persist dashboard submissions while retaining the inference-only API contract."""
-    key = request.headers.get("Idempotency-Key")
-    record_type = request.headers.get("X-Record-Type")
-    if key is None and record_type is None:
-        return await assess(request, patient, token)
-    try:
-        key = str(uuid.UUID(key or ""))
-    except ValueError:
-        raise HTTPException(400, "A UUID Idempotency-Key is required.") from None
-    if record_type not in {"Synthetic", "Synthetic Demo", "Authorised patient"}:
-        raise HTTPException(400, "Select a valid record type.")
-    actor = token.token_id
-    if record_type == "Authorised patient":
-        actor = _patient_record_writer(request.headers.get("X-Patient-Writer-Token", ""))
-
-    def reserve():
-        store = PatientRecords()
-        record, created = store.begin(
-            actor=actor, key=key, patient=patient.model_dump(),
-            record_type=record_type, mode=request.url.path,
-        )
-        return store, record, created
-
-    try:
-        store, record, created = await run_in_threadpool(reserve)
-    except RecordConflict:
-        raise HTTPException(409, "This submission key belongs to another assessment.") from None
-    except Exception as exc:
-        _logger.error("assessment_reservation_failed type=%s", type(exc).__name__)
-        raise HTTPException(503, "Could not save the assessment to Excel.") from None
-
-    assessment_id = record["Patient ID"]
-    if not created:
-        if record["Assessment Status"] != "Completed":
-            raise HTTPException(409, f"{assessment_id} is {record['Assessment Status'].lower()}.")
-        return _replay_assessment(record, detailed=request.url.path.endswith("/triage"))
-
-    try:
-        result = await assess(request, patient, token)
-    except (Exception, asyncio.CancelledError):
-        try:
-            await run_in_threadpool(store.finish, assessment_id)
-        except Exception as exc:
-            _logger.error("assessment_failure_write_failed id=%s type=%s", assessment_id, type(exc).__name__)
-            raise HTTPException(503, "Could not update the assessment in Excel.") from None
-        raise
-    try:
-        await run_in_threadpool(store.finish, assessment_id, result.model_dump())
-    except Exception as exc:
-        _logger.error("assessment_completion_failed id=%s type=%s", assessment_id, type(exc).__name__)
-        raise HTTPException(503, "The assessment results could not be saved to Excel.") from None
-    return result.model_copy(update={"assessment_id": assessment_id})
-
-
-def _patient_record_writer(credential):
-    """Authorise named writers with credentials separate from inference tokens."""
-    try:
-        writers = _json.loads(os.getenv("PATIENT_RECORD_WRITERS") or "{}")
-        if not isinstance(writers, dict):
-            raise ValueError
-    except ValueError:
-        raise HTTPException(503, "Patient record writer configuration is invalid.") from None
-    candidate = credential.encode()
-    shared = {item.strip() for var in ("API_TOKENS", "ADMIN_TOKENS")
-              for item in os.getenv(var, "").split(",")}
-    if credential and credential not in shared:
-        matches = [name for name, secret in writers.items()
-                   if name and isinstance(secret, str) and hmac.compare_digest(secret.encode(), candidate)]
-        if len(matches) == 1:
-            return f"patient-writer:{matches[0]}"
-    raise HTTPException(403, "An individual patient record writer credential is required.")
-
-
-def _replay_assessment(record, detailed):
-    acuity = int(record["Predicted Acuity"].split()[1])
-    payload = {
-        "assessment_id": record["Patient ID"],
-        "assessment_replayed": True,
-        "confidence": record["Confidence"],
-        "model_version": record["Model Version"],
-        "proba": {str(i): record[column] for i, column in enumerate(PROBABILITIES, 1)
-                  if record[column] is not None},
-        "safety_flags": (record["Safety Flags"] or "").split("; ") if record["Safety Flags"] else [],
-        "imputed_fields": (record["Imputed Fields"] or "").split("; ") if record["Imputed Fields"] else [],
-    }
-    if detailed:
-        return RationaleOut(predicted_acuity=acuity, llm_backend=record["Reasoning Source"], **payload)
-    return PredictionOut(predicted=acuity, **payload)
 
 
 def _predict_and_explain(patient: dict) -> tuple[dict, dict]:
@@ -767,6 +657,10 @@ def system_status() -> dict:
         "openai_configured": bool(getattr(_reasoner, "is_available", False)),
         "openai_model": getattr(_reasoner, "model_name", None),
         "local_fallback_available": True,
+        "shap_installed": _HAS_SHAP,
+        "models": [row["model"] for row in model._meta.get("evaluation", {}).get("leaderboard", [])
+                   if "model" in row] if model else [],
+
     }
 
 

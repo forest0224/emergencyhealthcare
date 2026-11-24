@@ -10,3 +10,4 @@
 !data/dataset.csv
 !.streamlit/
 !.streamlit/config.toml
+!.streamlit/soft-ui.css

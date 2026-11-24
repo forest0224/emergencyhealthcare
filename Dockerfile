@@ -16,7 +16,7 @@ CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 FROM runtime AS frontend
 COPY app.py synthetic_patients.py ./
-COPY .streamlit/config.toml .streamlit/config.toml
+COPY .streamlit/config.toml .streamlit/soft-ui.css .streamlit/
 USER app
 EXPOSE 8501
 CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0"]

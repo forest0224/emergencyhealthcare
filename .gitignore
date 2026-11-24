@@ -97,3 +97,4 @@ models/*
 # Private patient assessment workbook and lock
 /data/*.xlsx
 /data/*.xlsx.lock
+patient_records*.xlsx*

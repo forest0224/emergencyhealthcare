@@ -1,309 +1,100 @@
-# 🏥 Emergency Healthcare — ED-Triage Clinical Decision Support
+# Emergency Healthcare AI
 
-> **Decision-support only. Not a diagnosis. Confirm with a licensed clinician.**
+Emergency departments use triage to prioritise assessments when demand exceeds immediately available resources. This academic prototype demonstrates acuity classification, case-level explanations and structured clinical reasoning with a Streamlit dashboard and a FastAPI backend.
 
-An end-to-end ML + LLM system that predicts Emergency Department triage acuity (ESI levels 1–4), explains predictions with SHAP, and generates clinical rationale via IBM watsonx.ai or OpenAI — served through a production-ready FastAPI backend and a Python Tkinter desktop GUI.
+**Decision-support only. Not a diagnosis. Confirm with a licensed clinician.** Use synthetic cases for demonstrations. Do not delay urgent care based on this application.
 
----
+## Architecture
 
-## Table of Contents
-
-- [Features](#features)
-- [Project Structure](#project-structure)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Running the Project](#running-the-project)
-- [Python GUI Interface](#python-gui-interface)
-- [API Reference](#api-reference)
-- [ML Pipeline](#ml-pipeline)
-- [Docker Deployment](#docker-deployment)
-- [Testing](#testing)
-- [Governance & Safety](#governance--safety)
-- [Tech Stack](#tech-stack)
-
----
-
-## Features
-
-- 🤖 **XGBoost / LightGBM / CatBoost** ensemble trained on emergency triage data
-- 🔍 **SHAP explanations** — top feature contributions per acuity class
-- 🧠 **LLM clinical rationale** via IBM watsonx.ai (`granite-13b-chat-v2`) or OpenAI (`gpt-4o-mini`)
-- 🛡️ **Rule-based fallback** — always returns a safe response even when LLM is unavailable
-- 🖥️ **Python Tkinter desktop GUI** — submit patients and view results interactively
-- 📊 **Prometheus + Grafana** observability stack
-- 🔐 **Bearer token auth** with role-based access (`infer` / `admin`)
-- 📋 **Audit logging** with SHA-256 patient ID hashing (no PHI stored)
-- ⚖️ **Fairness audit** across age/gender groups
-- 📦 **Docker Compose** one-command deployment
-
----
-
-## Project Structure
-
-```
-emergencyhealthcare/
-├── interface.py                  # Python Tkinter desktop GUI
-├── run_full_pipeline.py          # CLI entry point (train / infer / demo / serve / audit)
-├── demo_patient.json             # Sample patient for quick testing
-├── master_emergency_triage_dataset.csv  # Training dataset
-│
-├── src/
-│   ├── api/
-│   │   ├── main.py               # FastAPI app factory + lifespan
-│   │   ├── routes.py             # Endpoints: /v1/predict, /v1/triage, /v1/health …
-│   │   ├── schemas.py            # Pydantic v2 request/response models
-│   │   ├── auth.py               # Bearer token authentication
-│   │   ├── audit_log.py          # Append-only JSONL audit trail
-│   │   ├── clinical_reasoning_llm.py  # watsonx / OpenAI LLM client
-│   │   ├── fallback_rationale.py # Rule-based clinical rationale (no LLM)
-│   │   └── pii_scrubber.py       # Free-text PII scrubbing before LLM calls
-│   └── ml/
-│       ├── feature_engineering.py  # MICE imputation + feature construction
-│       ├── tabular_models.py        # Train XGBoost / LightGBM / CatBoost
-│       ├── inference_api.py         # TriageModel — predict + SHAP explain
-│       ├── calibration.py           # Probability calibration
-│       ├── safety_metrics.py        # Critical miss rate + safety KPIs
-│       ├── fairness_audit.py        # Demographic parity / equalized odds
-│       ├── drift_monitor.py         # Feature drift detection (KS test)
-│       └── model_registry.py        # Model versioning helpers
-│
-├── tests/                        # pytest test suite
-├── docs/
-│   ├── MODEL_CARD.md
-│   ├── DATA_CARD.md
-│   └── DEPLOYMENT_RUNBOOK.md
-├── docker-compose.yml            # API + Prometheus + Grafana
-├── Dockerfile
-├── prometheus.yml
-├── Makefile
-└── requirements.txt
+```mermaid
+flowchart LR
+    U[Streamlit and Plotly] -->|Authenticated request| A[FastAPI]
+    A --> M[Preprocessing and tabular classifier]
+    M --> S[SHAP]
+    S --> R{Detailed reasoning}
+    R --> O[OpenAI]
+    R --> F[Local rules]
+    O -->|Unavailable or invalid| F
 ```
 
----
+- `app.py` handles navigation, form validation, plots and per-session results.
+- `backend/` contains API routes, schemas, auth, governance and reasoning.
+- `ml/` contains preprocessing, model fitting, prediction, calibration, safety, fairness, registry and drift tooling.
+- `data/dataset.csv` contains the existing dataset. `models/` holds generated artifacts.
+- `tests/` covers the API, ML, validation, reasoning and dashboard.
 
-## Quick Start
+## Local execution
 
-### 1. Clone & set up environment
+Use Python 3.11. Check out `refactor/streamlit-openai` and run the following from the project directory.
 
 ```bash
-git clone <repo-url>
-cd emergencyhealthcare
-
-python -m venv .venv311
-# Windows
-.venv311\Scripts\activate
-# macOS / Linux
-source .venv311/bin/activate
-
-pip install -r requirements.txt
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# Linux/macOS: source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-### 2. Configure environment
+Copy `.env.example` to `.env`. Set `API_TOKENS` and `FRONTEND_API_TOKEN` to the same high-entropy token. The backend accepts comma-separated inference tokens and optional admin tokens. Existing local environment files may need updated values.
 
 ```bash
-cp .env.example .env
-# Edit .env and fill in your API keys (see Configuration below)
+python -m ml.train
+uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-### 3. Train the model
+In a second terminal, run `streamlit run app.py`. The dashboard is at http://localhost:8501 and the API documentation is at http://localhost:8000/docs.
 
-```bash
-python run_full_pipeline.py --mode train
-```
-
-### 4. Start the API server
-
-```bash
-python run_full_pipeline.py --mode serve
-# Server starts at http://localhost:8000
-```
-
-### 5. Launch the desktop GUI
-
-```bash
-python interface.py
-```
-
----
-
-## Configuration
-
-Copy `.env.example` to `.env` and fill in the values:
-
-| Variable | Description | Default |
-|---|---|---|
-| `WATSONX_API_KEY` | IBM watsonx.ai API key | *(required for watsonx backend)* |
-| `WATSONX_PROJECT_ID` | watsonx project ID | *(required for watsonx backend)* |
-| `WATSONX_URL` | watsonx endpoint URL | `https://us-south.ml.cloud.ibm.com` |
-| `WATSONX_MODEL_ID` | LLM model ID | `ibm/granite-13b-chat-v2` |
-| `OPENAI_API_KEY` | OpenAI API key | *(required for openai backend)* |
-| `OPENAI_MODEL` | OpenAI model name | `gpt-4o-mini` |
-| `BACKEND` | LLM backend selection | `watsonx` |
-| `LLM_TIMEOUT_SECONDS` | LLM call timeout | `5` |
-| `API_TOKENS` | Comma-separated Bearer tokens | `dev-token-1,dev-token-2` |
-| `ADMIN_TOKENS` | Admin-role tokens (subset of API_TOKENS) | *(empty)* |
-| `MODEL_DIR` | Directory for saved models | `ml_runs` |
-| `AUDIT_LOG_DIR` | Audit log output directory | `outputs/audit` |
-| `LOG_LEVEL` | Logging verbosity | `INFO` |
-
-> **Tip:** The server works without LLM keys — it falls back to the rule-based rationale engine automatically.
-
----
-
-## Running the Project
-
-### CLI modes (`run_full_pipeline.py`)
-
-| Command | Description |
+| Variable | Purpose |
 |---|---|
-| `python run_full_pipeline.py --mode train` | Train & evaluate ML models, save best model |
-| `python run_full_pipeline.py --mode demo` | Run 3 canned patients through the full pipeline |
-| `python run_full_pipeline.py --mode infer --patient demo_patient.json` | Single patient inference |
-| `python run_full_pipeline.py --mode serve` | Start FastAPI server (port 8000) |
-| `python run_full_pipeline.py --mode test` | Run the pytest test suite |
-| `python run_full_pipeline.py --mode audit` | Run fairness + drift audit |
+| `OPENAI_API_KEY` | Optional backend credential. Local rules require no external connection. |
+| `OPENAI_MODEL` | Configurable chat model, defaults to `gpt-4o-mini` |
+| `LLM_TIMEOUT_SECONDS` | Reasoning deadline, defaults to five seconds |
+| `API_TOKENS`, `ADMIN_TOKENS` | Backend bearer credentials |
+| `BACKEND_URL`, `FRONTEND_API_TOKEN` | Streamlit server connection settings |
+| `MODEL_DIR`, `AUDIT_LOG_DIR`, `LOG_LEVEL` | Artifact directory, audit directory, logging level |
 
-### Makefile shortcuts
+## Data and model
 
-```bash
-make install      # pip install -r requirements.txt
-make train        # train ML models
-make serve        # start API server
-make test         # run tests
-make audit        # fairness audit
-make docker-up    # start full Docker stack
-make docker-down  # stop Docker stack
-```
+The CSV contains encounter identifiers, age, recorded gender, chief complaint, arrival hour, blood pressure, heart and respiratory rates, temperature, oxygen saturation, pain, and the acuity target. Training excludes validation encounters prefixed with `VT`. The original data card leaves provenance, collection dates and geography unverified. The prototype supports four classes from Critical through Less Urgent. Standard ESI has five levels.
 
----
+Candidates are XGBoost, LightGBM, CatBoost, logistic regression and an MLP. Training fits preprocessing within training folds, including MICE and complaint encoding. Model selection uses stratified cross-validation macro F1. A separate split is used to attempt probability calibration and an independent split supplies held-out metrics. The model directory contains the fitted artifacts, evaluation report, and feature drift reference. Use trusted artifacts only. Legacy local artifacts can load from `ml_runs`; retrain to obtain versioned evaluation and shared fitted preprocessing.
 
-## Python GUI Interface
+The original project flags single-snapshot measurements and sparse critical cases as limitations. Historical safety review targets were ESI 1 recall of at least 0.80 and a critical miss rate of at most 0.02. These targets do not establish clinical readiness.
 
-Launch with:
+The Model Performance page reports actual artifact metrics, including cross-validation results and available held-out safety and subgroup metrics. The supplied data has 28 distinct normalised complaints, each associated with a single acuity label. Internal row splits can repeat these complaint categories and overstate generalisation to unseen complaints. The supplied data also contains duplicate feature rows. These are internal estimates. External validation, prospective evaluation, fairness across unrecorded groups, and real clinical readiness remain future work.
 
-```bash
-python interface.py
-```
+SHAP explains the underlying classifier score for each available class. When calibration is applied, SHAP still explains the base classifier. Attribution is model behaviour and does not establish medical causation. Missing inputs are reported separately from observed inputs.
 
-The GUI connects to `http://localhost:8000` (make sure the server is running first).
+## API and reasoning
 
-**Features:**
-- Patient input form — all vitals, demographics, chief complaint
-- Live API status indicator (auto-refreshes every 8 seconds)
-- Colour-coded acuity badge: 🔴 Critical · 🟠 Emergent · 🟡 Urgent · 🟢 Less Urgent
-- Probability bars per acuity class
-- SHAP feature contribution viewer
-- Clinical rationale: immediate actions, differential risks, red flags
-- Raw JSON response tab
-- Endpoint switcher: fast predict vs full triage + rationale
-
----
-
-## API Reference
-
-Base URL: `http://localhost:8000`
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `GET` | `/v1/health` | None | Liveness probe |
-| `GET` | `/v1/ready` | None | Readiness probe (model loaded?) |
-| `GET` | `/v1/version` | None | API and model version info |
-| `GET` | `/v1/metrics` | None | Prometheus metrics |
-| `POST` | `/v1/predict` | Bearer token | ML-only fast prediction |
-| `POST` | `/v1/triage` | Bearer token | ML + SHAP + LLM rationale |
-
-Interactive docs: **[http://localhost:8000/docs](http://localhost:8000/docs)**
-
-### Example request
-
-```bash
-curl -X POST http://localhost:8000/v1/predict \
-  -H "Authorization: Bearer dev-token-1" \
-  -H "Content-Type: application/json" \
-  -d @demo_patient.json
-```
-
-### PatientIn fields
-
-| Field | Type | Required | Range | Description |
-|---|---|---|---|---|
-| `age` | float | ✅ | 0–120 | Age in years |
-| `chief_complaint` | string | ✅ | 1–500 chars | Free-text complaint |
-| `gender` | string | | M / F | Biological sex |
-| `arrival_hour` | int | | 0–23 | Hour of arrival |
-| `systolic_bp` | float | | 40–300 | mmHg |
-| `diastolic_bp` | float | | 20–200 | mmHg |
-| `heart_rate` | float | | 20–300 | bpm |
-| `respiratory_rate` | float | | 4–60 | breaths/min |
-| `temperature` | float | | 30–43 | °C |
-| `spo2` | float | | 50–100 | % |
-| `pain_score` | float | | 0–10 | Self-reported |
-| `encounter_id` | string | | | Audit linkage (hashed) |
-
----
-
-## ML Pipeline
-
-1. **Feature Engineering** — MICE imputation, NEWS2 proxy score, shock index, SpO₂ deficit, temp deviation, cyclical arrival hour encoding
-2. **Training** — 5-fold stratified cross-validation across XGBoost, LightGBM, and CatBoost; best model selected by macro F1
-3. **Calibration** — Isotonic regression probability calibration
-4. **SHAP** — TreeExplainer values computed per request for the top-k features
-5. **Safety metrics** — Critical miss rate (acuity 1/2 predicted as 4), under-triage rate
-6. **Drift monitoring** — KS-test on reference distribution (fit at train time)
-
----
-
-## Docker Deployment
-
-```bash
-# Build and start API + Prometheus + Grafana
-docker-compose up -d
-
-# Services:
-#   API        → http://localhost:8000
-#   Prometheus → http://localhost:9090
-#   Grafana    → http://localhost:3000  (admin / changeme_grafana_admin)
-```
-
----
-
-## Testing
-
-```bash
-pytest -q
-# or
-python run_full_pipeline.py --mode test
-```
-
-Test coverage includes API endpoints, schema validation, ML pipeline, and inference.
-
----
-
-## Governance & Safety
-
-- **Audit log** — every prediction is logged (request ID, token ID, hashed patient ID, prediction, confidence, latency). No raw PHI stored.
-- **PII scrubbing** — chief complaint is scrubbed before any LLM call.
-- **Fairness audit** — demographic parity and equalized odds across age buckets and gender groups.
-- **Critical miss rate** — tracked at train time and reported in `ml_runs/safety_report.json`.
-- **LLM timeout** — 5-second hard timeout on all LLM calls; always falls back to rule-based rationale.
-- **Disclaimer** — every API response includes: *"Decision-support only. Not a diagnosis. Confirm with a licensed clinician."*
-
----
-
-## Tech Stack
-
-| Layer | Technology |
+| Endpoint | Purpose |
 |---|---|
-| ML | XGBoost · LightGBM · CatBoost · scikit-learn |
-| Explainability | SHAP |
-| LLM | IBM watsonx.ai (Granite) · OpenAI |
-| API | FastAPI · Uvicorn · Pydantic v2 |
-| GUI | Python Tkinter (stdlib) |
-| Observability | Prometheus · Grafana |
-| Containerisation | Docker · Docker Compose |
-| Testing | pytest · httpx |
-| Python | 3.11+ |
+| GET `/v1/health` | API liveness |
+| GET `/v1/ready` | Model readiness |
+| GET `/v1/version` | API and model versions |
+| GET `/v1/status` | Model and reasoning configuration summary |
+| GET `/v1/performance` | Authenticated evaluation report |
+| GET `/v1/metrics` | Operational counters and latency |
+| POST `/v1/predict` | Authenticated classification and available SHAP |
+| POST `/v1/triage` | Authenticated detailed assessment with rationale |
 
----
+OpenAI is the only external generative AI provider. The backend sends allowlisted vitals and prediction context plus a scrubbed complaint, validates the response, and falls back to local Python rules on failure or deadline expiry. Model acuity stays fixed. OpenAI API usage can incur separate charges. Status reports configuration without sending a request.
 
-> Made with ❤️ for emergency healthcare decision support.
+Tokens stay server-side. Audit entries omit complaints and raw encounter identifiers. Pattern-based free-text scrubbing is limited and cannot guarantee de-identification. Restrict access to the dashboard and backend, use TLS at the deployment boundary, and keep secrets, model files and audit logs in controlled storage. The software has no clinical validation or regulatory approval established by this project.
+
+## Docker and hosting
+
+Configure the authentication values in `.env`, then run `docker compose up --build`. The API image trains during build. This can take several minutes and requires CPU and memory for all candidates. The frontend waits for API readiness. Compose binds both ports to the local interface and persists API audit logs in a named volume.
+
+On Render, create two Python 3.11 services in the same region from the refactor branch. Use a private backend service where available. Build the backend with `pip install -r requirements.txt && python -m ml.train --output-dir models`. Start it with `uvicorn backend.main:app --host 0.0.0.0 --port "$PORT"`. Build the dashboard with `pip install -r requirements.txt` and start it with `streamlit run app.py --server.address 0.0.0.0 --server.port "$PORT"`. Set `BACKEND_URL` to the internal service URL and configure matching token values in the platform secret manager. Set OpenAI credentials only on the backend. Persist audit logs on managed storage if required, and keep the model in the build output or on a trusted persistent volume. Size the service against measured training and startup requirements before using a small instance. A hosted dashboard requires restricted access because it sends the configured backend token for its users.
+
+See [Render private networking](https://render.com/docs/private-network), [web service configuration](https://render.com/docs/web-services), and [persistent disks](https://render.com/docs/disks). The two container targets can also run on other Docker-compatible hosts.
+
+## Verification
+
+```bash
+python -m compileall app.py backend ml
+python -m pytest -v
+python -m pip check
+```
+
+Automated reasoning tests mock the OpenAI SDK. No live key is needed.

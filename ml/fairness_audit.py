@@ -1,5 +1,5 @@
 """
-src/ml/fairness_audit.py
+ml/fairness_audit.py
 =========================
 Subgroup fairness audit for the ED-Triage acuity prediction model.
 
@@ -14,7 +14,7 @@ audit_fairness(X, y, y_pred,
 
 Usage
 -----
->>> from src.ml.fairness_audit import audit_fairness
+>>> from ml.fairness_audit import audit_fairness
 >>> report = audit_fairness(X, y, y_pred)
 >>> print(report.to_string())
 """

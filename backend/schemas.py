@@ -1,5 +1,5 @@
 """
-src/api/schemas.py
+backend/schemas.py
 ===================
 Pydantic v2 request/response schemas for the ED-Triage API.
 
@@ -9,19 +9,14 @@ PatientIn     – validated patient input (all vitals optional, range-checked)
 PredictionOut – ML-only prediction response
 RationaleOut  – Full triage with LLM clinical rationale (strict LLM contract)
 ErrorOut      – Structured error envelope
-
-Usage
------
->>> from src.api.schemas import PatientIn, PredictionOut
->>> p = PatientIn(age=45, heart_rate=110, systolic_bp=90,
-...               chief_complaint="chest pain")
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
 
 # ---------------------------------------------------------------------------
 # Input schema
@@ -31,11 +26,8 @@ class PatientIn(BaseModel):
     """Validated patient triage input.
 
     All vitals are optional — missing values are imputed by the ML pipeline.
-    Ranges are clinically validated; out-of-range values are rejected (422).
-
-    Example:
-        >>> p = PatientIn(age=65, heart_rate=120, systolic_bp=80,
-        ...               spo2=94, chief_complaint="shortness of breath")
+    Ranges are software-validation limits; they are NOT definitions of
+    medically normal values.
     """
 
     # Demographics
@@ -52,7 +44,7 @@ class PatientIn(BaseModel):
         ...,
         min_length=1,
         max_length=500,
-        description="Free-text chief complaint (will be PII-scrubbed before any LLM call).",
+        description="Free-text chief complaint (PII-scrubbed before any LLM call).",
     )
 
     # Timing
@@ -95,24 +87,19 @@ class PatientIn(BaseModel):
     # Optional encounter linkage — hashed before any storage
     encounter_id: Optional[str] = Field(
         None,
+        max_length=128,
         description="Optional encounter ID for audit linkage (SHA-256 hashed before storage).",
     )
+
+    @field_validator("chief_complaint", mode="before")
+    @classmethod
+    def trim_complaint(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("gender")
     @classmethod
     def validate_gender(cls, v: Optional[str]) -> Optional[str]:
-        """Normalise gender to 'M' | 'F' | None.
-
-        Args:
-            v: Raw gender string.
-
-        Returns:
-            'M', 'F', or None for anything unrecognised.
-
-        Example:
-            >>> PatientIn.validate_gender("male")
-            'M'
-        """
+        """Normalise gender to 'M' | 'F' | None."""
         if v is None:
             return None
         norm = v.strip().upper()
@@ -146,44 +133,26 @@ class PatientIn(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PredictionOut(BaseModel):
-    """ML-only triage prediction response (fast path).
-
-    ``proba`` is a dict keyed by acuity string ("1".."4") for easy JSON
-    consumption.  ``shap_top`` is a dict keyed by acuity class.
-
-    Example:
-        >>> out = PredictionOut(
-        ...     proba={"1": 0.6, "2": 0.3, "3": 0.08, "4": 0.02},
-        ...     predicted=1, confidence=0.60,
-        ...     imputed_fields=["spo2"],
-        ...     shap_top={"1": [{"feature": "shock_index", "shap_value": 0.42}]},
-        ...     safety_flags=["critical_acuity_immediate_review_required"],
-        ...     model_version="v1",
-        ... )
-    """
+    """ML-only triage prediction response (fast path)."""
     proba: dict[str, float] = Field(
-        description=(
-            'Probability per acuity class. Keys "1".."4", values 0–1. '
-            "Sum ≈ 1.0."
-        )
+        description='Probability per acuity class. Keys "1".."4", values 0–1.'
     )
-    predicted:      int   = Field(description="Most likely acuity class (1–4).")
-    confidence:     float = Field(description="Probability of the predicted class.")
+    predicted: int = Field(description="Most likely acuity class (1–4).")
+    confidence: float = Field(description="Probability of the predicted class.")
     imputed_fields: list[str] = Field(
         default_factory=list,
-        description="Vital fields that were missing and imputed by MICE.",
+        description="Vital fields that were missing and imputed.",
     )
     shap_top: dict[str, list[dict[str, Any]]] = Field(
         default_factory=dict,
-        description=(
-            "Top SHAP feature contributions keyed by acuity class. "
-            'Each value is a list of {"feature": str, "shap_value": float}.'
-        ),
+        description="Top SHAP feature contributions keyed by acuity class.",
     )
     safety_flags: list[str] = Field(
         default_factory=list,
-        description="Clinical safety alerts (e.g. 'critical_miss_risk').",
+        description="Clinical safety alerts.",
     )
+    model_config = ConfigDict(protected_namespaces=())
+    latency_ms: int | None = None
     model_version: str = Field(description="Active model version ID.")
     disclaimer: str = Field(
         default=(
@@ -194,38 +163,22 @@ class PredictionOut(BaseModel):
 
 
 class RationaleOut(BaseModel):
-    """Full triage output including LLM-generated or rule-based clinical rationale.
-
-    This is the strict schema that both the LLM JSON contract and the
-    rule_based_rationale() fallback must satisfy.
-
-    Example:
-        >>> r = RationaleOut(
-        ...     predicted_acuity=1,
-        ...     confidence=0.72,
-        ...     proba={"1": 0.72, "2": 0.20, "3": 0.06, "4": 0.02},
-        ...     imputed_fields=[],
-        ...     shap_top={"1": []},
-        ...     safety_flags=[],
-        ...     model_version="v1",
-        ...     differential_risks=["Acute MI", "Tension pneumothorax"],
-        ...     abnormal_vitals=["SpO2 93% — low"],
-        ...     immediate_actions=["Immediate physician assessment"],
-        ...     red_flags=["Critical hypotension (SBP 80 mmHg)"],
-        ...     safety_note="High acuity probability despite any imputed vitals.",
-        ...     llm_backend="watsonx",
-        ... )
-    """
+    """Full triage output including LLM-generated or rule-based rationale."""
     # ML output fields
-    predicted_acuity: int   = Field(description="Predicted acuity class (1–4).")
-    confidence:       float = Field(description="Probability of predicted class.")
+    predicted_acuity: int = Field(description="Predicted acuity class (1–4).")
+    confidence: float = Field(description="Probability of predicted class.")
     proba: dict[str, float] = Field(
         description='Probability per acuity class. Keys "1".."4".'
     )
     imputed_fields: list[str] = Field(default_factory=list)
     shap_top: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     safety_flags: list[str] = Field(default_factory=list)
+    model_config = ConfigDict(protected_namespaces=())
+    latency_ms: int | None = None
     model_version: str = Field(description="Active model version ID.")
+
+    rationale: str = ""
+    reasoning_model: str | None = None
 
     # LLM / rule-based rationale fields
     differential_risks: list[str] = Field(
@@ -250,7 +203,7 @@ class RationaleOut(BaseModel):
     )
     llm_backend: Optional[str] = Field(
         None,
-        description="Backend used: 'watsonx', 'openai', or 'rule_based'.",
+        description="Backend used: 'openai' or 'rule_based'.",
     )
     disclaimer: str = Field(
         default=(
@@ -261,15 +214,7 @@ class RationaleOut(BaseModel):
 
 
 class ErrorOut(BaseModel):
-    """Structured error response — never leaks PHI or stack traces to the client.
-
-    Example:
-        >>> e = ErrorOut(
-        ...     error_code="VALIDATION_ERROR",
-        ...     message="age must be <= 120",
-        ...     request_id="req-abc123",
-        ... )
-    """
+    """Structured error response — never leaks PHI or stack traces."""
     error_code: str = Field(description="Machine-readable error code.")
-    message:    str = Field(description="Human-readable error description.")
+    message: str = Field(description="Human-readable error description.")
     request_id: str = Field(description="UUID of the failing request.")

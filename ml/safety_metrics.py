@@ -1,5 +1,5 @@
 """
-src/ml/safety_metrics.py
+ml/safety_metrics.py
 =========================
 Clinical safety metrics for ED-Triage acuity prediction.
 
@@ -14,7 +14,7 @@ compute_under_triage_by_class(y_true, y_pred) -> pd.DataFrame
 
 Usage
 -----
->>> from src.ml.safety_metrics import compute_safety_metrics
+>>> from ml.safety_metrics import compute_safety_metrics
 >>> m = compute_safety_metrics(y_true, y_pred)
 >>> print(m["critical_miss_rate"])
 """

@@ -82,9 +82,14 @@ test-results/
 Thumbs.db
 
 # ── Docker ────────────────────────────────────────────────────────────────────
-.dockerignore
 
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Desktop.ini
 $RECYCLE.BIN/
+
+.env.*
+!.env.example
+.streamlit/secrets.toml
+models/*
+!models/.gitkeep

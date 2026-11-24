@@ -1,5 +1,5 @@
 """
-src/ml/calibration.py
+ml/calibration.py
 ======================
 Post-hoc probability calibration for the ED-Triage model.
 
@@ -11,7 +11,7 @@ calibrate(model, X_val, y_val, method='isotonic') -> model
 
 Usage
 -----
->>> from src.ml.calibration import calibrate
+>>> from ml.calibration import calibrate
 >>> cal_model = calibrate(best_model, X_val, y_val)
 """
 
@@ -90,8 +90,9 @@ def _get_proba(model, X: np.ndarray) -> np.ndarray:
     raw = model.predict_proba(X)
     cls_list = list(model.classes_)
     aligned  = np.zeros((len(X), 4), dtype=float)
+    zero_based = set(cls_list) == {0, 1, 2, 3}
     for i, cls in enumerate(cls_list):
-        orig = int(cls)
+        orig = int(cls) + int(zero_based)
         if 1 <= orig <= 4:
             aligned[:, orig - 1] = raw[:, i]
     return aligned
@@ -116,23 +117,25 @@ def calibrate(
     Args:
         model:   Fitted sklearn-compatible classifier.
         X_val:   Validation feature array / DataFrame.
-        y_val:   Validation integer labels (1-4).
+        y_val:   Validation labels in the fitted estimator's encoding.
         method:  Calibration method: 'isotonic' (default) or 'sigmoid'.
 
     Returns:
         The model with lower ECE (calibrated or original).
 
     Example:
-        >>> from src.ml.calibration import calibrate
+        >>> from ml.calibration import calibrate
         >>> cal_model = calibrate(best_model, X_val, y_val)
         >>> print("calibrated" if cal_model is not best_model else "original")
     """
     X = np.asarray(X_val, dtype=np.float32)
     y = np.asarray(y_val, dtype=int)
 
+    evaluation_labels = y + 1 if set(model.classes_) == {0, 1, 2, 3} else y
+
     # ---- ECE before calibration ----
     proba_before = _get_proba(model, X)
-    ece_before   = _ece_multiclass(y, proba_before)
+    ece_before   = _ece_multiclass(evaluation_labels, proba_before)
     print(f"[calibration] ECE before ({method}): {ece_before:.5f}")
 
     # ---- Fit calibrated wrapper ----
@@ -154,7 +157,7 @@ def calibrate(
 
     # ---- ECE after calibration ----
     proba_after = _get_proba(cal, X)
-    ece_after   = _ece_multiclass(y, proba_after)
+    ece_after   = _ece_multiclass(evaluation_labels, proba_after)
     print(f"[calibration] ECE after  ({method}): {ece_after:.5f}")
 
     if ece_after < ece_before:

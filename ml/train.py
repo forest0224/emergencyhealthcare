@@ -11,8 +11,8 @@ train_and_evaluate(X, y, *, n_splits=5, random_state=42,
 
 Usage
 -----
->>> from src.ml.feature_engineering import build_features
->>> from src.ml.tabular_models import train_and_evaluate
+>>> from ml.preprocessing import build_features
+>>> from ml.train import train_and_evaluate
 >>> X, y, meta = build_features("master_emergency_triage_dataset.csv")
 >>> results = train_and_evaluate(X, y)
 """
@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,11 +35,21 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
+    accuracy_score,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.pipeline import make_pipeline
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import LabelBinarizer, RobustScaler
+
+from ml.preprocessing import fit_features, training_data, transform_features
+from ml.calibration import calibrate
+from ml.safety_metrics import compute_safety_metrics
+from ml.fairness_audit import audit_fairness
+from ml.drift import fit_reference
 
 import matplotlib
 matplotlib.use("Agg")
@@ -133,6 +144,7 @@ def _make_models(random_state: int = RANDOM_STATE) -> dict[str, Any]:
             colsample_bytree=0.8,
             use_label_encoder=False,
             eval_metric="mlogloss",
+            num_class=4,
             random_state=random_state,
             tree_method="hist",
             verbosity=0,
@@ -398,7 +410,8 @@ def train_and_evaluate(
     *,
     n_splits: int = 5,
     random_state: int = RANDOM_STATE,
-    output_dir: str = "ml_runs",
+    output_dir: str = "models",
+    raw_data: pd.DataFrame | None = None,
 ) -> dict:
     """Train and stratified-CV evaluate all candidate models for ED-Triage.
 
@@ -452,10 +465,20 @@ def train_and_evaluate(
     print("TRAINING & CROSS-VALIDATION")
     print("=" * 70)
 
+    prepared = []
+    for tr_idx, val_idx in skf.split(X_arr, y_mapped):
+        if raw_data is None:
+            train_values, val_values = X_arr[tr_idx], X_arr[val_idx]
+        else:
+            train_features, _, fold_meta = fit_features(raw_data.iloc[tr_idx])
+            val_features = transform_features(raw_data.iloc[val_idx], fold_meta)
+            train_values = train_features.to_numpy(dtype=np.float32)
+            val_values = val_features.to_numpy(dtype=np.float32)
+        prepared.append((tr_idx, val_idx, train_values, val_values))
+
     for model_name, estimator in models.items():
-        print(f"\n── {model_name} ──")
-        for fold_i, (tr_idx, val_idx) in enumerate(skf.split(X_arr, y_mapped)):
-            X_tr, X_val = X_arr[tr_idx], X_arr[val_idx]
+        print(f"\n-- {model_name} --")
+        for fold_i, (tr_idx, val_idx, X_tr, X_val) in enumerate(prepared):
             y_tr, y_val = y_mapped[tr_idx], y_mapped[val_idx]
 
             # Scale for LR and MLP
@@ -483,7 +506,7 @@ def train_and_evaluate(
             raw_proba = estimator.predict_proba(X_val)
 
             # Align proba columns to CLASSES order (0→1, 1→2, 2→3, 3→4)
-            pred_orig  = np.array([label_imap.get(int(p), p) for p in raw_pred])
+            pred_orig  = np.array([label_imap.get(int(p), p) for p in raw_pred.ravel()])
             classes_in = list(estimator.classes_)
             proba_aligned = np.zeros((len(val_idx), 4), dtype=float)
             for col_i, cls_i in enumerate(classes_in):
@@ -574,6 +597,8 @@ def train_and_evaluate(
     except TypeError:
         best_estimator.fit(X_full, y_full)
 
+    if best_name in ("LogisticRegression", "MLP"):
+        best_estimator = make_pipeline(sc, best_estimator)
     joblib.dump(best_estimator, best_model_path)
     feature_meta = {
         "feature_names": feature_names,
@@ -612,9 +637,63 @@ def train_and_evaluate(
 
 
 # ---------------------------------------------------------------------------
-# Module entry point
-# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """Train, calibrate, and evaluate the selected model on independent splits."""
+    import argparse
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--dataset", default="data/dataset.csv")
+    parser.add_argument("--output-dir", default=os.getenv("MODEL_DIR", "models"))
+    args = parser.parse_args()
+    data = training_data(args.dataset)
+    training, held_out = train_test_split(
+        data, test_size=0.30, stratify=data.acuity_target, random_state=RANDOM_STATE
+    )
+    calibration, evaluation = train_test_split(
+        held_out, test_size=0.50, stratify=held_out.acuity_target, random_state=RANDOM_STATE
+    )
+    X, y, meta = fit_features(training)
+    out = Path(args.output_dir)
+    result = train_and_evaluate(X, y, output_dir=str(out), raw_data=training)
+    base = joblib.load(out / "best_model.pkl")
+    version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    X_cal = transform_features(calibration, meta).to_numpy(dtype=np.float32)
+    X_eval = transform_features(evaluation, meta).to_numpy(dtype=np.float32)
+    model = calibrate(base, X_cal, calibration.acuity_target.to_numpy() - 1, method="sigmoid")
+    probabilities = model.predict_proba(X_eval)
+    predictions = probabilities.argmax(axis=1) + 1
+    truth = evaluation.acuity_target.to_numpy()
+    safety = compute_safety_metrics(truth, predictions, probabilities)
+    groups = evaluation.copy()
+    groups["age_bucket"] = pd.cut(groups.age, [-1, 17, 39, 64, 79, 120])
+    fairness = audit_fairness(groups.reset_index(drop=True), truth, predictions)
+    report = {
+        "leaderboard": json.loads(result["leaderboard"].to_json(orient="records")),
+        "held_out": {
+            **_compute_fold_metrics(truth, predictions, probabilities),
+            "accuracy": accuracy_score(truth, predictions),
+            "macro_precision": precision_score(truth, predictions, average="macro", zero_division=0),
+            "macro_recall": recall_score(truth, predictions, average="macro", zero_division=0),
+        },
+        "confusion_matrix": confusion_matrix(truth, predictions, labels=CLASSES).tolist(),
+        "safety": safety,
+        "fairness": json.loads(fairness.to_json(orient="records")),
+        "calibrated": model is not base,
+        "evaluated_rows": len(evaluation),
+    }
+    report = json.loads(pd.Series(report).to_json())
+    meta.update(joblib.load(out / "feature_meta.pkl"))
+    meta.update(version=version, dataset_rows=len(data), evaluation=report)
+    joblib.dump(base, out / "explanation_model.pkl")
+    joblib.dump(model, out / "best_model.pkl")
+    joblib.dump(meta, out / "feature_meta.pkl")
+    fit_reference(X, ref_path=str(out / "drift_reference.pkl"))
+    (out / "evaluation.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
 if __name__ == "__main__":
-    from src.ml.feature_engineering import build_features
-    _X, _y, _meta = build_features("master_emergency_triage_dataset.csv")
-    train_and_evaluate(_X, _y, output_dir="ml_runs")
+    main()

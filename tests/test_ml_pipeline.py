@@ -47,7 +47,7 @@ def synth_csv(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def features(synth_csv):
-    from src.ml.feature_engineering import build_features
+    from ml.preprocessing import build_features
     return build_features(synth_csv)
 
 
@@ -81,7 +81,7 @@ class TestBuildFeatures:
 class TestTrainAndEvaluate:
     def test_returns_macro_f1_and_under_triage(self, features, tmp_path):
         """train_and_evaluate result dict contains required metric keys."""
-        from src.ml import tabular_models as tm_mod
+        from ml import train as tm_mod
         from sklearn.linear_model import LogisticRegression
 
         X, y, _ = features
@@ -112,7 +112,7 @@ class TestTrainAndEvaluate:
 
 class TestSafetyMetrics:
     def test_keys_present(self):
-        from src.ml.safety_metrics import compute_safety_metrics
+        from ml.safety_metrics import compute_safety_metrics
         y_true = np.array([1, 1, 2, 3, 3, 4])
         y_pred = np.array([1, 2, 2, 3, 4, 4])
         m = compute_safety_metrics(y_true, y_pred)
@@ -127,12 +127,12 @@ class TestSafetyMetrics:
 
 class TestPIIScrubber:
     def test_strips_name_and_mrn(self):
-        from src.api.pii_scrubber import scrub_free_text
+        from backend.security import scrub_free_text
         result = scrub_free_text("Dr. Smith MRN 12345")
         assert "Smith" not in result
         assert "12345" not in result
 
     def test_preserves_clinical_text(self):
-        from src.api.pii_scrubber import scrub_free_text
+        from backend.security import scrub_free_text
         text = "chest pain and dyspnoea"
         assert scrub_free_text(text) == text

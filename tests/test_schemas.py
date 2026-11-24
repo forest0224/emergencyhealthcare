@@ -5,7 +5,7 @@ Pydantic v2 schema validation tests.
 """
 import pytest
 from pydantic import ValidationError
-from src.api.schemas import PatientIn, PredictionOut, ErrorOut
+from backend.schemas import PatientIn, PredictionOut, ErrorOut
 
 
 def _valid() -> dict:

@@ -1,5 +1,5 @@
 """
-src/ml/drift_monitor.py
+ml/drift.py
 ========================
 Population drift monitoring via Population Stability Index (PSI).
 
@@ -18,7 +18,7 @@ check_drift(X_new, threshold=0.05) -> pd.DataFrame
 
 Usage
 -----
->>> from src.ml.drift_monitor import fit_reference, check_drift
+>>> from ml.drift import fit_reference, check_drift
 >>> fit_reference(X_train)
 >>> report = check_drift(X_new)
 >>> print(report[report["psi"] > 0.10])

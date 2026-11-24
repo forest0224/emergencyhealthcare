@@ -1,1 +1,0 @@
-"""ED-Triage API package."""

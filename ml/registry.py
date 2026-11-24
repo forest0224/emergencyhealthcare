@@ -1,5 +1,5 @@
 """
-src/ml/model_registry.py
+ml/registry.py
 =========================
 Versioned model registry backed by a JSON manifest and file-system artifacts.
 

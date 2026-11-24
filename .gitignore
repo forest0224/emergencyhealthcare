@@ -82,9 +82,19 @@ test-results/
 Thumbs.db
 
 # ── Docker ────────────────────────────────────────────────────────────────────
-.dockerignore
 
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Desktop.ini
 $RECYCLE.BIN/
+
+.env.*
+!.env.example
+.streamlit/secrets.toml
+models/*
+!models/.gitkeep
+
+# Private patient assessment workbook and lock
+/data/*.xlsx
+/data/*.xlsx.lock
+patient_records*.xlsx*

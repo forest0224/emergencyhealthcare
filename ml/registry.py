@@ -1,5 +1,5 @@
 """
-src/ml/model_registry.py
+ml/registry.py
 =========================
 Versioned model registry backed by a JSON manifest and file-system artifacts.
 
@@ -14,8 +14,8 @@ class ModelRegistry
 
 Usage
 -----
->>> reg = ModelRegistry("ml_runs")
->>> vid = reg.register("ml_runs/best_model.pkl", {"macro_f1": 0.82}, "v1")
+>>> reg = ModelRegistry("models")
+>>> vid = reg.register("models/best_model.pkl", {"macro_f1": 0.82}, "v1")
 >>> reg.promote(vid)
 >>> model, meta = reg.load()
 """
@@ -45,21 +45,21 @@ class ModelRegistry:
     artifacts into {registry_dir}/versions/{version_id}/.
 
     Args:
-        registry_dir: Root directory for registry data (default "ml_runs").
+        registry_dir: Root directory for registry data (default "models").
 
     Example:
-        >>> reg = ModelRegistry("ml_runs")
+        >>> reg = ModelRegistry("models")
         >>> versions = reg.list_versions()
     """
 
-    def __init__(self, registry_dir: str = "ml_runs") -> None:
+    def __init__(self, registry_dir: str = "models") -> None:
         """Initialize registry, creating directories and manifest if needed.
 
         Args:
-            registry_dir: Path to the root ml_runs directory.
+            registry_dir: Path to the root models directory.
 
         Example:
-            >>> reg = ModelRegistry("ml_runs")
+            >>> reg = ModelRegistry("models")
         """
         self._root     = Path(registry_dir)
         self._ver_dir  = self._root / _VERSIONS_DIR
@@ -142,7 +142,7 @@ class ModelRegistry:
             version_id string.
 
         Example:
-            >>> vid = reg.register("ml_runs/best_model.pkl",
+            >>> vid = reg.register("models/best_model.pkl",
             ...                    {"macro_f1": 0.82}, tag="xgb-v1")
         """
         ts  = datetime.now(tz=timezone.utc).isoformat()

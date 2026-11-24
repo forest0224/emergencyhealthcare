@@ -1,5 +1,5 @@
 """
-src/ml/drift_monitor.py
+ml/drift.py
 ========================
 Population drift monitoring via Population Stability Index (PSI).
 
@@ -18,7 +18,7 @@ check_drift(X_new, threshold=0.05) -> pd.DataFrame
 
 Usage
 -----
->>> from src.ml.drift_monitor import fit_reference, check_drift
+>>> from ml.drift import fit_reference, check_drift
 >>> fit_reference(X_train)
 >>> report = check_drift(X_new)
 >>> print(report[report["psi"] > 0.10])
@@ -36,7 +36,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_DEFAULT_REF_PATH = "ml_runs/drift_ref.pkl"
+_DEFAULT_REF_PATH = "models/drift_reference.pkl"
 _N_BINS           = 10
 _PSI_WARN         = 0.10
 _PSI_ALERT        = 0.20
@@ -121,7 +121,7 @@ def fit_reference(
         ref_path: Path to save the reference pickle.
 
     Example:
-        >>> fit_reference(X_train, ref_path="ml_runs/drift_ref.pkl")
+        >>> fit_reference(X_train, ref_path="models/drift_reference.pkl")
     """
     path = Path(ref_path)
     path.parent.mkdir(parents=True, exist_ok=True)

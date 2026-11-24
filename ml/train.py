@@ -1,5 +1,5 @@
 """
-src/ml/tabular_models.py
+ml/train.py
 =========================
 Train and cross-validate multiple tabular classifiers for ED-Triage acuity
 prediction.  Handles severe class imbalance inside training folds only.
@@ -7,13 +7,13 @@ prediction.  Handles severe class imbalance inside training folds only.
 Public API
 ----------
 train_and_evaluate(X, y, *, n_splits=5, random_state=42,
-                   output_dir="ml_runs") -> dict
+                   output_dir="models") -> dict
 
 Usage
 -----
->>> from src.ml.feature_engineering import build_features
->>> from src.ml.tabular_models import train_and_evaluate
->>> X, y, meta = build_features("master_emergency_triage_dataset.csv")
+>>> from ml.preprocessing import build_features
+>>> from ml.train import train_and_evaluate
+>>> X, y, meta = build_features("data/dataset.csv")
 >>> results = train_and_evaluate(X, y)
 """
 
@@ -22,23 +22,41 @@ from __future__ import annotations
 import json
 import os
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
+from sklearn.calibration import calibration_curve
+from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     classification_report,
     confusion_matrix,
     f1_score,
+    accuracy_score,
+    balanced_accuracy_score,
+    log_loss,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import make_pipeline
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import LabelBinarizer, RobustScaler
+
+from ml.preprocessing import INPUT_BOUNDS, fit_features, training_data, transform_features
+from ml.data_quality import dataset_audit, evaluation_groups, holdout, split_folds
+from ml.simulate import simulate
+from ml.calibration import calibrate
+from ml.safety_metrics import compute_safety_metrics
+from ml.fairness_audit import audit_fairness
+from ml.drift import fit_reference
 
 import matplotlib
 matplotlib.use("Agg")
@@ -133,8 +151,10 @@ def _make_models(random_state: int = RANDOM_STATE) -> dict[str, Any]:
             colsample_bytree=0.8,
             use_label_encoder=False,
             eval_metric="mlogloss",
+            num_class=4,
             random_state=random_state,
             tree_method="hist",
+            n_jobs=4,
             verbosity=0,
         )
 
@@ -148,7 +168,7 @@ def _make_models(random_state: int = RANDOM_STATE) -> dict[str, Any]:
             class_weight="balanced",
             random_state=random_state,
             verbosity=-1,
-            n_jobs=-1,
+            n_jobs=4,
         )
 
     if _HAS_CAT:
@@ -159,6 +179,8 @@ def _make_models(random_state: int = RANDOM_STATE) -> dict[str, Any]:
             auto_class_weights="Balanced",
             random_seed=random_state,
             verbose=0,
+            thread_count=4,
+            allow_writing_files=False,
         )
 
     models["LogisticRegression"] = LogisticRegression(
@@ -181,6 +203,19 @@ def _make_models(random_state: int = RANDOM_STATE) -> dict[str, Any]:
     )
 
     return models
+
+
+REGULARIZATION_GRID = {
+    "XGBoost": {"max_depth": 3, "min_child_weight": 3},
+    "LightGBM": {"max_depth": 3, "num_leaves": 8, "min_child_samples": 30},
+    "CatBoost": {"depth": 4, "l2_leaf_reg": 6},
+    "LogisticRegression": {"C": .2},
+    "MLP": {"alpha": .01},
+}
+
+
+def _configured_model(name, parameters):
+    return _make_models()[name].set_params(**parameters)
 
 
 def _smote_resample(
@@ -266,7 +301,7 @@ def _plot_confusion(
         out_dir:    Directory to save the PNG.
 
     Example:
-        >>> _plot_confusion(cm, "XGBoost", Path("ml_runs"))
+        >>> _plot_confusion(cm, "XGBoost", Path("models"))
     """
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(cm, cmap="Blues")
@@ -303,7 +338,7 @@ def _plot_roc_pr(
         out_dir:     Directory to save the PNG.
 
     Example:
-        >>> _plot_roc_pr(y_true, y_proba, "XGBoost", Path("ml_runs"))
+        >>> _plot_roc_pr(y_true, y_proba, "XGBoost", Path("models"))
     """
     from sklearn.metrics import roc_curve, precision_recall_curve
 
@@ -354,7 +389,7 @@ def _plot_feature_importance(
         top_n:         Number of top features to show.
 
     Example:
-        >>> _plot_feature_importance(imp, names, "XGBoost", Path("ml_runs"))
+        >>> _plot_feature_importance(imp, names, "XGBoost", Path("models"))
     """
     idx   = np.argsort(importances)[-top_n:]
     names = [feature_names[i] for i in idx]
@@ -398,7 +433,10 @@ def train_and_evaluate(
     *,
     n_splits: int = 5,
     random_state: int = RANDOM_STATE,
-    output_dir: str = "ml_runs",
+    output_dir: str = "models",
+    raw_data: pd.DataFrame | None = None,
+    group_ids: np.ndarray | None = None,
+    fit_final: bool = True,
 ) -> dict:
     """Train and stratified-CV evaluate all candidate models for ED-Triage.
 
@@ -427,7 +465,7 @@ def train_and_evaluate(
         best_model_path (str), all_metrics (dict).
 
     Example:
-        >>> results = train_and_evaluate(X, y, output_dir="ml_runs")
+        >>> results = train_and_evaluate(X, y, output_dir="models")
         >>> print(results["best_model_name"])
     """
     out_dir = _ensure_dir(Path(output_dir))
@@ -440,7 +478,15 @@ def train_and_evaluate(
     label_imap = {i: c for c, i in label_map.items()}
     y_mapped   = np.array([label_map[v] for v in y_arr])
 
-    models  = _make_models(random_state)
+    defaults = _make_models(random_state)
+    configurations = {name: {} for name in defaults}
+    if raw_data is not None:
+        configurations.update({f"{name} (regularized)": params
+                               for name, params in REGULARIZATION_GRID.items() if name in defaults})
+    models = {
+        key: clone(defaults[key.split(" (")[0]]).set_params(**params)
+        for key, params in configurations.items()
+    }
     skf     = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
     all_metrics: dict[str, list[dict]] = {name: [] for name in models}
@@ -452,18 +498,38 @@ def train_and_evaluate(
     print("TRAINING & CROSS-VALIDATION")
     print("=" * 70)
 
-    for model_name, estimator in models.items():
-        print(f"\n── {model_name} ──")
-        for fold_i, (tr_idx, val_idx) in enumerate(skf.split(X_arr, y_mapped)):
-            X_tr, X_val = X_arr[tr_idx], X_arr[val_idx]
+    prepared = []
+    folds = (split_folds(y_arr, group_ids, n_splits, random_state)
+             if group_ids is not None else skf.split(X_arr, y_mapped))
+    baseline_scores = []
+    for tr_idx, val_idx in folds:
+        if raw_data is None:
+            train_values, val_values = X_arr[tr_idx], X_arr[val_idx]
+        else:
+            train_features, _, fold_meta = fit_features(raw_data.iloc[tr_idx])
+            feature_names = fold_meta['feature_names']
+            val_features = transform_features(raw_data.iloc[val_idx], fold_meta)
+            train_values = train_features.to_numpy(dtype=np.float32)
+            val_values = val_features.to_numpy(dtype=np.float32)
+        prepared.append((tr_idx, val_idx, train_values, val_values))
+        dummy = DummyClassifier(strategy="most_frequent").fit(train_values, y_arr[tr_idx])
+        baseline_scores.append(f1_score(
+            y_arr[val_idx], dummy.predict(val_values), labels=CLASSES, average="macro", zero_division=0
+        ))
+
+    for variant, estimator in models.items():
+        model_name = variant.split(" (")[0]
+        print(f"\n-- {variant} --")
+        for fold_i, (tr_idx, val_idx, X_tr, X_val) in enumerate(prepared):
             y_tr, y_val = y_mapped[tr_idx], y_mapped[val_idx]
 
             # Scale for LR and MLP
             if model_name in ("LogisticRegression", "MLP"):
                 X_tr, X_val = _scale_X(X_tr, X_val)
 
-            # SMOTE (applied before class-weight models too for uniformity)
-            if model_name in ("LogisticRegression", "MLP"):
+            observed_train = X_tr
+            # LR already balances classes through weights.
+            if model_name == "MLP":
                 X_tr, y_tr = _smote_resample(X_tr, y_tr)
 
             # XGBoost: set scale_pos_weight via sample_weight equivalent
@@ -483,7 +549,7 @@ def train_and_evaluate(
             raw_proba = estimator.predict_proba(X_val)
 
             # Align proba columns to CLASSES order (0→1, 1→2, 2→3, 3→4)
-            pred_orig  = np.array([label_imap.get(int(p), p) for p in raw_pred])
+            pred_orig  = np.array([label_imap.get(int(p), p) for p in raw_pred.ravel()])
             classes_in = list(estimator.classes_)
             proba_aligned = np.zeros((len(val_idx), 4), dtype=float)
             for col_i, cls_i in enumerate(classes_in):
@@ -493,16 +559,41 @@ def train_and_evaluate(
                     proba_aligned[:, out_col] = raw_proba[:, col_i]
 
             y_val_orig = np.array([label_imap[v] for v in y_val])
-            oof_preds[model_name][val_idx]   = pred_orig
-            oof_probas[model_name][val_idx]  = proba_aligned
+            oof_preds[variant][val_idx]   = pred_orig
+            oof_probas[variant][val_idx]  = proba_aligned
 
             fm = _compute_fold_metrics(y_val_orig, pred_orig, proba_aligned)
-            all_metrics[model_name].append(fm)
+            train_labels = estimator.predict(observed_train).ravel() + 1
+            fm.update(
+                training_accuracy=float(accuracy_score(y_arr[tr_idx], train_labels)),
+                training_macro_f1=float(f1_score(
+                    y_arr[tr_idx], train_labels, labels=CLASSES, average="macro", zero_division=0
+                )),
+                validation_accuracy=float(accuracy_score(y_val_orig, pred_orig)),
+                critical_miss_rate=float((pred_orig[y_val_orig == 1] >= 3).mean())
+                    if (y_val_orig == 1).any() else 0.0,
+            )
+            all_metrics[variant].append(fm)
             print(
                 f"  Fold {fold_i+1}: macro_F1={fm['macro_f1']:.4f}  "
                 f"Acuity-1 Recall={fm['acuity1_recall']:.4f}  "
                 f"Under-triage={fm['under_triage_rate']:.4f}"
             )
+
+    configuration_scores = {
+        variant: float(np.mean([fold["macro_f1"] for fold in scores]))
+        for variant, scores in all_metrics.items()
+    }
+    winners = {
+        name: max((variant for variant in models if variant.split(" (")[0] == name),
+                  key=configuration_scores.__getitem__)
+        for name in defaults
+    }
+    selected_parameters = {name: configurations[variant] for name, variant in winners.items()}
+    models = {name: models[variant] for name, variant in winners.items()}
+    all_metrics = {name: all_metrics[variant] for name, variant in winners.items()}
+    oof_preds = {name: oof_preds[variant] for name, variant in winners.items()}
+    oof_probas = {name: oof_probas[variant] for name, variant in winners.items()}
 
     # ---------------------------------------------------------------------------
     # Aggregate metrics + write per-model artefacts
@@ -516,6 +607,8 @@ def train_and_evaluate(
         fold_metrics = all_metrics[model_name]
         agg = {k: float(np.mean([f[k] for f in fold_metrics])) for k in fold_metrics[0]}
 
+        agg["macro_f1_std"] = float(np.std([f["macro_f1"] for f in fold_metrics], ddof=1))
+        agg["training_validation_gap"] = agg["training_macro_f1"] - agg["macro_f1"]
         flag = "⚠ " if agg["acuity1_recall"] < 0.80 else "  "
         summary_rows.append({"model": model_name, **agg, "flag": flag})
 
@@ -557,32 +650,36 @@ def train_and_evaluate(
     # ---------------------------------------------------------------------------
     # Retrain best model on full data, save artefacts
     # ---------------------------------------------------------------------------
-    best_estimator = models[best_name]
-    X_full = X_arr.copy()
-    y_full = y_mapped.copy()
-    if best_name in ("LogisticRegression", "MLP"):
-        sc = RobustScaler()
-        X_full = sc.fit_transform(X_full)
-        X_full, y_full = _smote_resample(X_full, y_full)
-    fit_kwargs_full: dict[str, Any] = {}
-    if best_name == "XGBoost":
-        cw_full = _class_weights(y_full)
-        sw_full = np.array([cw_full[v] for v in y_full], dtype=float)
-        fit_kwargs_full["sample_weight"] = sw_full
-    try:
-        best_estimator.fit(X_full, y_full, **fit_kwargs_full)
-    except TypeError:
-        best_estimator.fit(X_full, y_full)
+    if fit_final:
+        best_estimator = models[best_name]
+        X_full = X_arr.copy()
+        y_full = y_mapped.copy()
+        if best_name in ("LogisticRegression", "MLP"):
+            sc = RobustScaler()
+            X_full = sc.fit_transform(X_full)
+            if best_name == "MLP":
+                X_full, y_full = _smote_resample(X_full, y_full)
+        fit_kwargs_full: dict[str, Any] = {}
+        if best_name == "XGBoost":
+            cw_full = _class_weights(y_full)
+            sw_full = np.array([cw_full[v] for v in y_full], dtype=float)
+            fit_kwargs_full["sample_weight"] = sw_full
+        try:
+            best_estimator.fit(X_full, y_full, **fit_kwargs_full)
+        except TypeError:
+            best_estimator.fit(X_full, y_full)
 
-    joblib.dump(best_estimator, best_model_path)
-    feature_meta = {
-        "feature_names": feature_names,
-        "label_map":     label_map,
-        "label_imap":    label_imap,
-        "best_model":    best_name,
-    }
-    joblib.dump(feature_meta, out_dir / "feature_meta.pkl")
-    print(f"\n[saved] best_model.pkl ({best_name}) → {best_model_path}")
+        if best_name in ("LogisticRegression", "MLP"):
+            best_estimator = make_pipeline(sc, best_estimator)
+        joblib.dump(best_estimator, best_model_path)
+        feature_meta = {
+            "feature_names": feature_names,
+            "label_map":     label_map,
+            "label_imap":    label_imap,
+            "best_model":    best_name,
+        }
+        joblib.dump(feature_meta, out_dir / "feature_meta.pkl")
+        print(f"\n[saved] best_model.pkl ({best_name}) → {best_model_path}")
 
     # ---------------------------------------------------------------------------
     # Leaderboard
@@ -608,13 +705,205 @@ def train_and_evaluate(
         "best_model_name":  best_name,
         "best_model_path":  best_model_path,
         "all_metrics":      all_metrics,
+        "baseline_macro_f1": float(np.mean(baseline_scores)),
+        "selected_parameters": selected_parameters,
+        "configuration_scores": configuration_scores,
     }
 
 
 # ---------------------------------------------------------------------------
-# Module entry point
-# ---------------------------------------------------------------------------
+
+
+def _evaluate(model, frame, meta):
+    matrix = transform_features(frame, meta).to_numpy(dtype=np.float32)
+    probabilities = model.predict_proba(matrix)
+    truth = frame.acuity_target.to_numpy(dtype=int)
+    predictions = probabilities.argmax(axis=1) + 1
+    return truth, predictions, probabilities
+
+
+def _stress_tests(model, evaluation, meta, clean_macro_f1):
+    rng = np.random.default_rng(RANDOM_STATE)
+    measure = list(INPUT_BOUNDS)[2:]
+    scenarios = {}
+    missing = evaluation.copy()
+    missing[measure] = missing[measure].mask(rng.random((len(missing), len(measure))) < .30)
+    scenarios["30% random measurement masking"] = missing
+    jitter = evaluation.copy()
+    for col, sd in zip(measure, [5, 4, 4, 1.5, .2, 1, .5]):
+        jitter[col] = (jitter[col] + rng.normal(0, sd, len(jitter))).clip(*INPUT_BOUNDS[col])
+    both_bp = jitter.systolic_bp.notna() & jitter.diastolic_bp.notna()
+    jitter.loc[both_bp, "diastolic_bp"] = np.minimum(
+        jitter.loc[both_bp, "diastolic_bp"], jitter.loc[both_bp, "systolic_bp"] - 1
+    )
+    scenarios["Measurement variation"] = jitter
+    unusual = evaluation.copy()
+    unusual["heart_rate"] = 55
+    unusual["spo2"] = 89
+    scenarios["Contrasting pulse and oxygen readings"] = unusual
+    scenarios["Shifted simulator with overlapping complaints"] = simulate(2000, seed=171, shift=True)
+    rows = []
+    for name, frame in scenarios.items():
+        truth, prediction, probability = _evaluate(model, frame, meta)
+        scores = compute_safety_metrics(truth, prediction, probability)
+        rows.append({"scenario": name, "rows": len(frame), "macro_f1": scores["macro_f1"],
+                     "critical_miss_rate": scores["critical_miss_rate"],
+                     "macro_f1_change": scores["macro_f1"] - clean_macro_f1
+                         if frame is not scenarios["Shifted simulator with overlapping complaints"] else None})
+    return rows
+
+
+def _calibration_points(truth, probability, name):
+    rows = []
+    for i, cls in enumerate(CLASSES):
+        observed, predicted = calibration_curve(truth == cls, probability[:, i], n_bins=10)
+        rows.extend({"class": cls, "probability": p, "observed": o, "model": name}
+                    for p, o in zip(predicted, observed))
+    return rows
+
+
+def _learning_curve(training, groups, name, parameters, full_metrics):
+    """Single fixed development fold with two group-disjoint smaller refits."""
+    tr, va = split_folds(training.acuity_target, groups)[0]
+    validation = training.iloc[va]
+    reservoir = training.iloc[tr]
+    partitions = split_folds(reservoir.acuity_target, groups[tr])
+    rows = []
+    for count in (1, 3):
+        indices = np.concatenate([fold[1] for fold in partitions[:count]])
+        subset = reservoir.iloc[indices]
+        X, labels, meta = fit_features(subset)
+        matrix = X.to_numpy(dtype=np.float32)
+        y = labels.to_numpy() - 1
+        model = _configured_model(name, parameters)
+        if name in ("MLP", "LogisticRegression"):
+            scaler = RobustScaler().fit(matrix)
+            matrix = scaler.transform(matrix)
+        if name == "MLP":
+            matrix, y = _smote_resample(matrix, y)
+        kwargs = {}
+        if name == "XGBoost":
+            weights = _class_weights(y)
+            kwargs["sample_weight"] = np.array([weights[value] for value in y])
+        model.fit(matrix, y, **kwargs)
+        if name in ("MLP", "LogisticRegression"):
+            model = make_pipeline(scaler, model)
+        truth, predicted, _ = _evaluate(model, validation, meta)
+        rows.append({
+            "training_rows": len(subset),
+            "training_macro_f1": f1_score(labels, model.predict(X.to_numpy(dtype=np.float32)).ravel() + 1,
+                                           labels=CLASSES, average="macro", zero_division=0),
+            "validation_macro_f1": f1_score(truth, predicted, labels=CLASSES, average="macro", zero_division=0),
+        })
+    rows.append({"training_rows": len(reservoir),
+                 "training_macro_f1": full_metrics["training_macro_f1"],
+                 "validation_macro_f1": full_metrics["macro_f1"]})
+    return rows
+
+
+def main() -> None:
+    """Evaluate the selected classifier once on a group-disjoint test set."""
+    import argparse
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--dataset", default="data/dataset.csv")
+    parser.add_argument("--source", default="Original project CSV (provenance unverified)")
+    parser.add_argument("--output-dir", default=os.getenv("MODEL_DIR", "models"))
+    args = parser.parse_args()
+    data = training_data(args.dataset)
+    audit = dataset_audit(args.dataset, data)
+    group_ids = evaluation_groups(data)
+    development_idx, test_idx = holdout(data.acuity_target, group_ids)
+    development = data.iloc[development_idx].reset_index(drop=True)
+    development_groups = group_ids[development_idx]
+    evaluation = data.iloc[test_idx].reset_index(drop=True)
+
+    y = development.acuity_target.astype(int)
+    X = pd.DataFrame(index=development.index)
+    out = _ensure_dir(Path(args.output_dir))
+    result = train_and_evaluate(X, y, output_dir=str(out), raw_data=development,
+                                group_ids=development_groups, fit_final=False)
+    selected = result["best_model_name"]
+    selected_parameters = result["selected_parameters"][selected]
+    learning_curve = _learning_curve(
+        development, development_groups, selected, selected_parameters, result["all_metrics"][selected][0]
+    )
+
+    fit_idx, calibration_idx = holdout(development.acuity_target, development_groups, seed=43)
+    training, calibration = development.iloc[fit_idx], development.iloc[calibration_idx]
+    X, y, meta = fit_features(training)
+    matrix = X.to_numpy(dtype=np.float32)
+    labels = y.to_numpy() - 1
+    base = _configured_model(selected, selected_parameters)
+    if selected in ("LogisticRegression", "MLP"):
+        scaler = RobustScaler().fit(matrix)
+        matrix = scaler.transform(matrix)
+    if selected == "MLP":
+        matrix, labels = _smote_resample(matrix, labels)
+    fit_kwargs = {}
+    if selected == "XGBoost":
+        weights = _class_weights(labels)
+        fit_kwargs["sample_weight"] = np.array([weights[value] for value in labels])
+    base.fit(matrix, labels, **fit_kwargs)
+    if selected in ("LogisticRegression", "MLP"):
+        base = make_pipeline(scaler, base)
+    x_cal = transform_features(calibration, meta).to_numpy(dtype=np.float32)
+    model = calibrate(base, x_cal, calibration.acuity_target.to_numpy() - 1,
+                      method="sigmoid", always_fit=True)
+    truth, predictions, probabilities = _evaluate(model, evaluation, meta)
+    _, base_prediction, base_probability = _evaluate(base, evaluation, meta)
+    safety = compute_safety_metrics(truth, predictions, probabilities)
+    base_safety = compute_safety_metrics(truth, base_prediction, base_probability)
+    subgroup = evaluation.copy()
+    subgroup["age_bucket"] = pd.cut(subgroup.age, [-1, 17, 39, 64, 79, 120])
+    fairness = audit_fairness(subgroup, truth, predictions)
+    by_class = classification_report(truth, predictions, labels=CLASSES, output_dict=True, zero_division=0)
+
+    report = {
+        "protocol": "Five-fold stratified group CV; ~80% development, ~20% independent holdout. "
+                    "Hyperparameters and models ranked by development macro F1. Sigmoid fit on reserved development data.",
+        "dataset_source": args.source, "selected_model": selected,
+        "dataset_audit": audit, "development_rows": len(development),
+        "fit_rows": len(training), "calibration_rows": len(calibration), "evaluated_rows": len(evaluation),
+        "configuration_scores": result["configuration_scores"],
+        "selected_parameters": result["selected_parameters"],
+        "cv_folds": result["all_metrics"], "baseline_macro_f1": result["baseline_macro_f1"],
+        "leaderboard": json.loads(result["leaderboard"].to_json(orient="records")),
+        "held_out": {
+            **_compute_fold_metrics(truth, predictions, probabilities),
+            "accuracy": accuracy_score(truth, predictions),
+            "balanced_accuracy": balanced_accuracy_score(truth, predictions),
+            "macro_precision": precision_score(truth, predictions, average="macro", zero_division=0),
+            "macro_recall": recall_score(truth, predictions, average="macro", zero_division=0),
+        },
+        "per_class": [{"class": cls, **by_class[str(cls)]} for cls in CLASSES],
+        "confusion_matrix": confusion_matrix(truth, predictions, labels=CLASSES).tolist(),
+        "safety": safety, "fairness": json.loads(fairness.to_json(orient="records")),
+        "calibrated": model is not base,
+        "calibration": {
+            "method": "Sigmoid; one-vs-rest macro ECE with ten equal-width bins.",
+            "uncalibrated": {"log_loss": log_loss(truth, base_probability, labels=CLASSES),
+                             **{key: base_safety[key] for key in ("ece_macro", "brier_macro")}},
+            "deployed": {"log_loss": log_loss(truth, probabilities, labels=CLASSES),
+                         **{key: safety[key] for key in ("ece_macro", "brier_macro")}},
+            "points": _calibration_points(truth, base_probability, "Base")
+                      + _calibration_points(truth, probabilities, "Deployed"),
+        },
+        "learning_curve": learning_curve,
+        "robustness": _stress_tests(model, evaluation, meta, safety["macro_f1"]),
+    }
+    report = json.loads(pd.Series(report).to_json())
+    meta.update(best_model=selected, label_imap=dict(enumerate(CLASSES)))
+    meta.update(version=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
+                dataset_rows=len(data), evaluation=report)
+    joblib.dump(base, out / "explanation_model.pkl")
+    joblib.dump(model, out / "best_model.pkl")
+    joblib.dump(meta, out / "feature_meta.pkl")
+    fit_reference(X, ref_path=str(out / "drift_reference.pkl"))
+    (out / "evaluation.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
 if __name__ == "__main__":
-    from src.ml.feature_engineering import build_features
-    _X, _y, _meta = build_features("master_emergency_triage_dataset.csv")
-    train_and_evaluate(_X, _y, output_dir="ml_runs")
+    main()

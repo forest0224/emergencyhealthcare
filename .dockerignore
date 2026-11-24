@@ -1,0 +1,13 @@
+**
+!requirements.txt
+!app.py
+!synthetic_patients.py
+!backend/
+!backend/*.py
+!ml/
+!ml/*.py
+!data/
+!data/dataset.csv
+!.streamlit/
+!.streamlit/config.toml
+!.streamlit/soft-ui.css

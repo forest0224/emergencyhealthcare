@@ -11,7 +11,7 @@ import pytest
 
 os.environ.setdefault("API_TOKENS", "test-tok,test-admin")
 os.environ.setdefault("ADMIN_TOKENS", "test-admin")
-os.environ.setdefault("MODEL_DIR", "ml_runs")
+os.environ.setdefault("MODEL_DIR", "models")
 
 
 # ---------------------------------------------------------------------------
@@ -83,15 +83,15 @@ class _Client:
 
 @pytest.fixture(scope="module")
 def client():
-    from src.api.main import create_app
-    import src.api.routes as _routes
-    from src.api.fallback_rationale import rule_based_rationale
+    from backend.main import create_app
+    import backend.main as _routes
+    from backend.reasoning import rule_based_rationale
 
     _routes.set_model(_FakeModel())
 
     fake_reasoner = MagicMock()
     fb = rule_based_rationale({"age": 65, "heart_rate": 120}, {"predicted": 1})
-    fb["llm_backend"] = "watsonx"
+    fb["llm_backend"] = "openai"
     fake_reasoner.reason.return_value = fb
     _routes.set_reasoner(fake_reasoner)
 
@@ -151,8 +151,8 @@ class TestTriage:
 
     def test_fallback_when_llm_raises(self, client):
         """LLM raising ClinicalReasonerError → rule_based_rationale used, 200."""
-        import src.api.routes as _routes
-        from src.api.clinical_reasoning_llm import ClinicalReasonerError
+        import backend.main as _routes
+        from backend.reasoning import ClinicalReasonerError
 
         bad = MagicMock()
         bad.reason.side_effect = ClinicalReasonerError("down")
@@ -184,7 +184,20 @@ def test_version(client):
 # ---------------------------------------------------------------------------
 
 def test_pii_scrubber_removes_phi():
-    from src.api.pii_scrubber import scrub_free_text
+    from backend.security import scrub_free_text
     result = scrub_free_text("Dr. Smith MRN 12345")
     assert "Smith" not in result
     assert "12345" not in result
+
+
+def test_inference_ignores_legacy_record_headers_without_storing_data(client, monkeypatch, tmp_path):
+    workbook = tmp_path / "patient_records.xlsx"
+    monkeypatch.setenv("PATIENT_RECORDS_PATH", str(workbook))
+    headers = {**_AUTH, "X-Record-Type": "Synthetic Demo", "Idempotency-Key": "old-client"}
+    for resource in ("/v1/predict", "/v1/triage"):
+        response = client.post(resource, json=_PATIENT, headers=headers)
+        assert response.status_code == 200
+        assert "assessment_id" not in response.json()
+    assert not workbook.exists()
+    for resource in ("/v1/patients", "/v1/patients/export", "/v1/patients/PAT-X"):
+        assert client.get(resource, headers=_AUTH).status_code == 404

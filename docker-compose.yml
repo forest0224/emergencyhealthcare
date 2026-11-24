@@ -1,64 +1,36 @@
-version: "3.9"
-
 services:
-
-  # ── FastAPI application ─────────────────────────────────────────────────
   api:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: ed-triage-api:latest
-    container_name: ed-triage-api
-    restart: unless-stopped
-    env_file: .env
+      target: api
+    environment:
+      API_TOKENS: ${API_TOKENS:-}
+      ADMIN_TOKENS: ${ADMIN_TOKENS:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-5}
+      MODEL_DIR: /app/models
+      AUDIT_LOG_DIR: /app/outputs/audit
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
-      - ml_runs_data:/app/ml_runs
-      - outputs_data:/app/outputs
-      - logs_data:/app/logs
+      - audit:/app/outputs
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
-      interval: 30s
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/v1/ready', timeout=3)"]
+      interval: 15s
       timeout: 5s
       retries: 3
-      start_period: 15s
-    depends_on:
-      - prometheus
-
-  # ── Prometheus ─────────────────────────────────────────────────────────
-  prometheus:
-    image: prom/prometheus:v2.53.0
-    container_name: ed-triage-prometheus
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/etc/prometheus/console_libraries"
-      - "--web.console.templates=/etc/prometheus/consoles"
-
-  # ── Grafana ────────────────────────────────────────────────────────────
-  grafana:
-    image: grafana/grafana:11.0.0
-    container_name: ed-triage-grafana
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
+  frontend:
+    build:
+      context: .
+      target: frontend
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=changeme_grafana_admin
-    volumes:
-      - grafana_data:/var/lib/grafana
+      BACKEND_URL: http://api:8000
+      FRONTEND_API_TOKEN: ${FRONTEND_API_TOKEN:-}
     depends_on:
-      - prometheus
-
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8501:8501"
 volumes:
-  ml_runs_data:
-  outputs_data:
-  logs_data:
-  prometheus_data:
-  grafana_data:
+  audit:

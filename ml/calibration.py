@@ -1,5 +1,5 @@
 """
-src/ml/calibration.py
+ml/calibration.py
 ======================
 Post-hoc probability calibration for the ED-Triage model.
 
@@ -11,7 +11,7 @@ calibrate(model, X_val, y_val, method='isotonic') -> model
 
 Usage
 -----
->>> from src.ml.calibration import calibrate
+>>> from ml.calibration import calibrate
 >>> cal_model = calibrate(best_model, X_val, y_val)
 """
 
@@ -23,6 +23,8 @@ import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import LabelBinarizer
+
+from ml.safety_metrics import binary_ece
 
 CLASSES      = [1, 2, 3, 4]
 RANDOM_STATE = 42
@@ -54,24 +56,10 @@ def _ece_multiclass(
     lb.fit(CLASSES)
     y_bin = lb.transform(y_true)
 
-    bins  = np.linspace(0.0, 1.0, n_bins + 1)
-    ece_per_class: list[float] = []
-    n = len(y_true)
-
-    for cls_idx in range(y_bin.shape[1]):
-        yt_bin = y_bin[:, cls_idx]
-        yp_col = y_proba[:, cls_idx]
-        ece_val = 0.0
-        for lo, hi in zip(bins[:-1], bins[1:]):
-            mask = (yp_col >= lo) & (yp_col < hi)
-            if mask.sum() == 0:
-                continue
-            acc  = float(yt_bin[mask].mean())
-            conf = float(yp_col[mask].mean())
-            ece_val += (mask.sum() / n) * abs(acc - conf)
-        ece_per_class.append(ece_val)
-
-    return float(np.mean(ece_per_class))
+    return float(np.mean([
+        binary_ece(y_bin[:, i], y_proba[:, i], n_bins)
+        for i in range(y_bin.shape[1])
+    ]))
 
 
 def _get_proba(model, X: np.ndarray) -> np.ndarray:
@@ -90,8 +78,9 @@ def _get_proba(model, X: np.ndarray) -> np.ndarray:
     raw = model.predict_proba(X)
     cls_list = list(model.classes_)
     aligned  = np.zeros((len(X), 4), dtype=float)
+    zero_based = set(cls_list) == {0, 1, 2, 3}
     for i, cls in enumerate(cls_list):
-        orig = int(cls)
+        orig = int(cls) + int(zero_based)
         if 1 <= orig <= 4:
             aligned[:, orig - 1] = raw[:, i]
     return aligned
@@ -106,6 +95,8 @@ def calibrate(
     X_val: pd.DataFrame | np.ndarray,
     y_val: pd.Series | np.ndarray,
     method: str = "isotonic",
+    *,
+    always_fit: bool = False,
 ) -> object:
     """Calibrate model probabilities and return the better-calibrated version.
 
@@ -116,23 +107,25 @@ def calibrate(
     Args:
         model:   Fitted sklearn-compatible classifier.
         X_val:   Validation feature array / DataFrame.
-        y_val:   Validation integer labels (1-4).
+        y_val:   Validation labels in the fitted estimator's encoding.
         method:  Calibration method: 'isotonic' (default) or 'sigmoid'.
 
     Returns:
         The model with lower ECE (calibrated or original).
 
     Example:
-        >>> from src.ml.calibration import calibrate
+        >>> from ml.calibration import calibrate
         >>> cal_model = calibrate(best_model, X_val, y_val)
         >>> print("calibrated" if cal_model is not best_model else "original")
     """
     X = np.asarray(X_val, dtype=np.float32)
     y = np.asarray(y_val, dtype=int)
 
+    evaluation_labels = y + 1 if set(model.classes_) == {0, 1, 2, 3} else y
+
     # ---- ECE before calibration ----
     proba_before = _get_proba(model, X)
-    ece_before   = _ece_multiclass(y, proba_before)
+    ece_before   = _ece_multiclass(evaluation_labels, proba_before)
     print(f"[calibration] ECE before ({method}): {ece_before:.5f}")
 
     # ---- Fit calibrated wrapper ----
@@ -154,13 +147,13 @@ def calibrate(
 
     # ---- ECE after calibration ----
     proba_after = _get_proba(cal, X)
-    ece_after   = _ece_multiclass(y, proba_after)
+    ece_after   = _ece_multiclass(evaluation_labels, proba_after)
     print(f"[calibration] ECE after  ({method}): {ece_after:.5f}")
 
-    if ece_after < ece_before:
+    if always_fit or ece_after < ece_before:
         print(
             f"[calibration] Calibrated model selected "
-            f"(ECE reduced by {ece_before - ece_after:.5f})."
+            f"(calibration-set ECE change {ece_after - ece_before:+.5f})."
         )
         return cal
     else:

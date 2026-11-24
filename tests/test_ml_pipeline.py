@@ -47,7 +47,7 @@ def synth_csv(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def features(synth_csv):
-    from src.ml.feature_engineering import build_features
+    from ml.preprocessing import build_features
     return build_features(synth_csv)
 
 
@@ -81,7 +81,7 @@ class TestBuildFeatures:
 class TestTrainAndEvaluate:
     def test_returns_macro_f1_and_under_triage(self, features, tmp_path):
         """train_and_evaluate result dict contains required metric keys."""
-        from src.ml import tabular_models as tm_mod
+        from ml import train as tm_mod
         from sklearn.linear_model import LogisticRegression
 
         X, y, _ = features
@@ -112,7 +112,7 @@ class TestTrainAndEvaluate:
 
 class TestSafetyMetrics:
     def test_keys_present(self):
-        from src.ml.safety_metrics import compute_safety_metrics
+        from ml.safety_metrics import compute_safety_metrics
         y_true = np.array([1, 1, 2, 3, 3, 4])
         y_pred = np.array([1, 2, 2, 3, 4, 4])
         m = compute_safety_metrics(y_true, y_pred)
@@ -127,12 +127,102 @@ class TestSafetyMetrics:
 
 class TestPIIScrubber:
     def test_strips_name_and_mrn(self):
-        from src.api.pii_scrubber import scrub_free_text
+        from backend.security import scrub_free_text
         result = scrub_free_text("Dr. Smith MRN 12345")
         assert "Smith" not in result
         assert "12345" not in result
 
     def test_preserves_clinical_text(self):
-        from src.api.pii_scrubber import scrub_free_text
+        from backend.security import scrub_free_text
         text = "chest pain and dyspnoea"
         assert scrub_free_text(text) == text
+
+
+
+def test_group_partitions_keep_identifiers_and_duplicate_profiles_together():
+    from ml.data_quality import evaluation_groups, holdout, split_folds
+    from ml.simulate import simulate
+
+    data = simulate(800, seed=3)
+    data["patient_id"] = data["encounter_id"]
+    data.loc[1, "patient_id"] = data.loc[0, "patient_id"]
+    duplicate = data.iloc[[1]].assign(encounter_id="independent-id", patient_id="another-patient")
+    data = pd.concat([data, duplicate], ignore_index=True)
+    groups = evaluation_groups(data)
+    assert groups[0] == groups[1] == groups[-1]
+    dev, test = holdout(data.acuity_target, groups)
+    assert len(dev) + len(test) == len(data)
+    assert not set(groups[dev]) & set(groups[test])
+    for train, validation in split_folds(data.acuity_target.iloc[dev], groups[dev]):
+        assert not set(groups[dev][train]) & set(groups[dev][validation])
+
+
+def test_preprocessing_ignores_complaint_target_and_extra_columns():
+    from ml.preprocessing import fit_features, transform_features
+    from ml.simulate import simulate
+
+    data = simulate(400, seed=8)
+    features, _, meta = fit_features(data.iloc[:300])
+    assert not {"acuity_target", "encounter_id", "chief_complaint_enc"} & set(features)
+    validation = data.iloc[300:].copy()
+    original = transform_features(validation, meta)
+    validation["acuity_target"] = 4
+    validation["chief_complaint"] = "different complaint"
+    validation["post_treatment_value"] = 1000000
+    pd.testing.assert_frame_equal(original, transform_features(validation, meta))
+
+
+def test_simulator_uses_overlapping_complaints_and_respects_input_ranges():
+    from ml.preprocessing import INPUT_BOUNDS
+    from ml.simulate import simulate
+
+    frame = simulate(1000)
+    assert frame.groupby("chief_complaint").acuity_target.nunique().eq(4).all()
+    assert frame.isna().any().any()
+    assert frame.encounter_id.is_unique
+    for name, bounds in INPUT_BOUNDS.items():
+        assert frame[name].dropna().between(*bounds).all()
+    measured = frame.dropna(subset=["systolic_bp", "diastolic_bp"])
+    assert measured.systolic_bp.gt(measured.diastolic_bp).all()
+
+
+
+def test_ece_includes_probability_one():
+    from ml.safety_metrics import binary_ece
+
+    assert binary_ece(np.array([0]), np.array([1.0])) == 1.0
+
+
+
+def test_multiclass_shap_normalization_rejects_ambiguous_output():
+    from ml.predict import _class_attributions
+
+    values = np.arange(12, dtype=float).reshape(1, 3, 4)
+    legacy = [values[:, :, index] for index in range(4)]
+    assert np.array_equal(_class_attributions(values, 3, 4), values[0].T)
+    assert np.array_equal(_class_attributions(legacy, 3, 4), values[0].T)
+    with pytest.raises(ValueError):
+        _class_attributions(values[0], 3, 4)
+
+
+
+def test_shap_uses_estimator_class_order_and_filters_nonfinite_values(monkeypatch):
+    from types import SimpleNamespace
+
+    from ml import predict
+
+    monkeypatch.setattr(predict, "_HAS_SHAP", True)
+    monkeypatch.setattr(predict, "build_single_row",
+                        lambda patient, meta: (pd.DataFrame([[64., 90.]]), []))
+    model = predict.TriageModel.__new__(predict.TriageModel)
+    model._meta = {"feature_names": ["age", "heart_rate"]}
+    model._explanation_model = SimpleNamespace(classes_=[2, 0, 3, 1])
+    model._label_imap = {0: 1, 1: 2, 2: 3, 3: 4}
+    model._explainer = SimpleNamespace(shap_values=lambda inputs: np.array(
+        [[[0.3, 0.1, 0.4, 0.2], [np.inf, -0.5, -0.7, -0.8]]]
+    ))
+    result = model.explain({})
+    assert result["3"] == [{"feature": "age", "shap_value": 0.3}]
+    assert result["1"][0] == {"feature": "heart_rate", "shap_value": -0.5}
+    assert result["4"][0] == {"feature": "heart_rate", "shap_value": -0.7}
+    assert result["2"][0] == {"feature": "heart_rate", "shap_value": -0.8}
